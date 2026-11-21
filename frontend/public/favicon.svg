@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AiBrainWorX">
+<defs><linearGradient id="mint" x1="0" y1="0" x2="0.2" y2="1"><stop stop-color="#caffd4"/><stop offset="1" stop-color="#66efab"/></linearGradient></defs>
+<rect x="8" y="8" width="496" height="496" rx="106" fill="#0b141b" stroke="#90d9ac" stroke-width="14"/>
+<path d="M56 372 170 115h66l113 257h-77l-19-48H153l-19 48Zm120-108h54l-27-73Z" fill="url(#mint)" fill-rule="evenodd"/>
+<rect x="365" y="115" width="64" height="64" rx="13" fill="url(#mint)"/>
+<rect x="365" y="207" width="64" height="165" rx="10" fill="url(#mint)"/>
+</svg>

@@ -1,0 +1,30 @@
+# Runtime intelligence store & local state
+data/
+
+# Environment variables & secret material
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Rust build artifacts
+backend/target/
+backend/**/*.rs.bk
+
+# Frontend dependencies & compiled bundle
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Logs & OS / editor metadata
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Local video production workspace & renders
+video/

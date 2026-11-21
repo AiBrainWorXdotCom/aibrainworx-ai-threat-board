@@ -1,0 +1,548 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Severity {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    pub fn rank(self) -> u8 {
+        match self {
+            Severity::Info => 0,
+            Severity::Low => 1,
+            Severity::Medium => 2,
+            Severity::High => 3,
+            Severity::Critical => 4,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Critical => "CRITICAL",
+            Severity::High => "HIGH",
+            Severity::Medium => "MEDIUM",
+            Severity::Low => "LOW",
+            Severity::Info => "INFO",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "CRITICAL" | "CRIT" => Severity::Critical,
+            "HIGH" => Severity::High,
+            "MEDIUM" | "MODERATE" | "MED" => Severity::Medium,
+            "LOW" => Severity::Low,
+            _ => Severity::Info,
+        }
+    }
+
+    pub fn from_cvss(score: f64) -> Self {
+        if score >= 9.0 {
+            Severity::Critical
+        } else if score >= 7.0 {
+            Severity::High
+        } else if score >= 4.0 {
+            Severity::Medium
+        } else if score > 0.0 {
+            Severity::Low
+        } else {
+            Severity::Info
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoreFactor {
+    pub label: String,
+    pub points: u8,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vulnerability {
+    pub id: String,
+    pub aliases: Vec<String>,
+    pub title: String,
+    pub description: String,
+    pub severity: Severity,
+    pub cvss_score: Option<f64>,
+    pub cvss_vector: Option<String>,
+    pub epss_score: Option<f64>,
+    pub epss_percentile: Option<f64>,
+    pub ai_risk_score: u8,
+    pub ai_score_factors: Vec<ScoreFactor>,
+    pub ai_summary: String,
+    pub is_kev: bool,
+    pub kev_date_added: Option<String>,
+    pub kev_due_date: Option<String>,
+    pub kev_required_action: Option<String>,
+    pub forensic_triage: Option<String>,
+    pub ransomware_use: bool,
+    pub has_public_exploit: bool,
+    pub is_ai_related: bool,
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub ecosystem: Option<String>,
+    pub patched_version: Option<String>,
+    pub cwes: Vec<String>,
+    pub mitre_tactics: Vec<String>,
+    pub attack_vectors: Vec<String>,
+    pub sources: Vec<String>,
+    pub references: Vec<String>,
+    pub published_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub first_seen_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatNewsItem {
+    pub id: String,
+    pub source: String,
+    pub category: String,
+    pub title: String,
+    pub summary: String,
+    pub url: String,
+    pub published_at: DateTime<Utc>,
+    pub first_seen_at: DateTime<Utc>,
+    pub extracted_cves: Vec<String>,
+    pub severity: Severity,
+    pub ai_risk_score: u8,
+    pub tags: Vec<String>,
+    pub is_vulnerability_news: bool,
+    pub is_ai_related: bool,
+    pub ai_triage_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PortAttack {
+    pub rank: u32,
+    pub port: u16,
+    pub service_name: String,
+    pub records: u64,
+    pub targets: u64,
+    pub sources: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AttackerIp {
+    pub ip: String,
+    pub attacks: u64,
+    pub count: u64,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BotnetC2 {
+    pub ip_address: String,
+    pub port: u16,
+    pub status: String,
+    pub hostname: Option<String>,
+    pub as_number: Option<u64>,
+    pub as_name: Option<String>,
+    pub country: Option<String>,
+    pub malware: String,
+    pub first_seen: Option<String>,
+    pub last_online: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PhishingUrl {
+    pub url: String,
+    pub domain: String,
+    pub suspected_brand: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EpssTopThreat {
+    pub cve: String,
+    pub epss: f64,
+    pub percentile: f64,
+    pub date: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkTelemetry {
+    pub infocon_status: String,
+    pub top_attacked_ports: Vec<PortAttack>,
+    pub top_attacking_ips: Vec<AttackerIp>,
+    pub botnet_c2s: Vec<BotnetC2>,
+    pub phishing_urls: Vec<PhishingUrl>,
+    pub phishing_total_count: usize,
+    pub compromised_ips_sample: Vec<String>,
+    pub compromised_ips_total_count: usize,
+    pub top_epss_global: Vec<EpssTopThreat>,
+}
+
+impl Default for NetworkTelemetry {
+    fn default() -> Self {
+        Self {
+            infocon_status: "green".to_string(),
+            top_attacked_ports: Vec::new(),
+            top_attacking_ips: Vec::new(),
+            botnet_c2s: Vec::new(),
+            phishing_urls: Vec::new(),
+            phishing_total_count: 0,
+            compromised_ips_sample: Vec::new(),
+            compromised_ips_total_count: 0,
+            top_epss_global: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreatAlert {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub severity: Severity,
+    pub alert_type: String,
+    pub title: String,
+    pub summary: String,
+    pub source: String,
+    pub url: Option<String>,
+    pub cve_ids: Vec<String>,
+    pub matched_reasons: Vec<String>,
+    pub ai_risk_score: u8,
+    pub acknowledged: bool,
+    pub linked_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRules {
+    pub min_severity: Severity,
+    pub alert_on_any_kev: bool,
+    pub alert_on_vuln_news: bool,
+    pub alert_on_ai_threats: bool,
+    pub watchlist_keywords: Vec<String>,
+    pub poll_interval_secs: u64,
+}
+
+impl Default for AlertRules {
+    fn default() -> Self {
+        Self {
+            min_severity: Severity::High,
+            alert_on_any_kev: true,
+            alert_on_vuln_news: true,
+            alert_on_ai_threats: true,
+            watchlist_keywords: vec![
+                "zero-day".to_string(),
+                "0-day".to_string(),
+                "rce".to_string(),
+                "actively exploited".to_string(),
+                "ransomware".to_string(),
+                "ai".to_string(),
+                "llm".to_string(),
+                "mcp".to_string(),
+                "supply chain".to_string(),
+                "critical".to_string(),
+                "bypass".to_string(),
+                "backdoor".to_string(),
+            ],
+            poll_interval_secs: 3600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedHealth {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub url: String,
+    pub status: String,
+    pub http_status: Option<u16>,
+    pub latency_ms: u64,
+    pub items_fetched: usize,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelCount {
+    pub label: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationAction {
+    pub cve_id: String,
+    pub vendor_product: String,
+    pub reason: String,
+    pub urgency: String,
+    pub due_date: Option<String>,
+    pub ai_risk_score: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyVelocityPoint {
+    pub date: String,
+    pub cves: usize,
+    pub kev: usize,
+    pub news: usize,
+    pub exploits: usize,
+    pub critical: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiThreatBrief {
+    pub generated_at: DateTime<Utc>,
+    pub global_threat_index: u8,
+    pub threat_level_label: String,
+    pub executive_summary: String,
+    pub key_findings: Vec<String>,
+    pub top_attack_vectors: Vec<LabelCount>,
+    pub top_mitre_tactics: Vec<LabelCount>,
+    pub top_targeted_vendors: Vec<LabelCount>,
+    pub remediation_priorities: Vec<RemediationAction>,
+    pub velocity_7d: Vec<DailyVelocityPoint>,
+}
+
+impl Default for AiThreatBrief {
+    fn default() -> Self {
+        Self {
+            generated_at: Utc::now(),
+            global_threat_index: 0,
+            threat_level_label: "GUARDED".to_string(),
+            executive_summary: "Initializing first intelligence sweep across public cybersecurity feeds...".to_string(),
+            key_findings: Vec::new(),
+            top_attack_vectors: Vec::new(),
+            top_mitre_tactics: Vec::new(),
+            top_targeted_vendors: Vec::new(),
+            remediation_priorities: Vec::new(),
+            velocity_7d: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum SseEvent {
+    NewAlert(ThreatAlert),
+    SweepStarted {
+        started_at: DateTime<Utc>,
+    },
+    SweepCompleted {
+        completed_at: DateTime<Utc>,
+        new_alerts: usize,
+        total_vulns: usize,
+        total_news: usize,
+        next_sweep_at: DateTime<Utc>,
+    },
+    Heartbeat {
+        server_time: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProviderKind {
+    #[default]
+    Builtin,
+    Ollama,
+    LmStudio,
+    LlamaCpp,
+    OpenAi,
+    Anthropic,
+    Gemini,
+    OpenRouter,
+    Groq,
+    DeepSeek,
+    Mistral,
+    Xai,
+    CustomOpenAi,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    pub provider: AiProviderKind,
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip)]
+    pub api_key: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+    pub system_prompt: String,
+    pub enrich_briefing: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: AiProviderKind::Builtin,
+            base_url: String::new(),
+            model: "local-threat-graph-v1".to_string(),
+            api_key: String::new(),
+            temperature: 0.2,
+            max_tokens: 1600,
+            timeout_secs: 60,
+            system_prompt: "You are AiBrainWorX, a senior Cyber Threat Intelligence Analyst. Analyze the live CVE, CISA KEV, EPSS, Exploit-DB, news, and network IOC telemetry provided. Cite exact CVE IDs, highlight active exploitation or AI/ML supply-chain exposure, and give concrete prioritized defensive actions in concise Markdown.".to_string(),
+            enrich_briefing: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiProviderPreset {
+    pub id: AiProviderKind,
+    pub name: String,
+    pub group: String,
+    pub default_base_url: String,
+    pub default_model: String,
+    pub suggested_models: Vec<String>,
+    pub requires_api_key: bool,
+    pub env_var_name: Option<String>,
+    pub env_key_present: bool,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiConfigPublic {
+    pub provider: AiProviderKind,
+    pub base_url: String,
+    pub model: String,
+    pub has_api_key: bool,
+    pub api_key_masked: String,
+    pub env_key_present: bool,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+    pub system_prompt: String,
+    pub enrich_briefing: bool,
+    pub active_label: String,
+    pub presets: Vec<AiProviderPreset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiConfigUpdate {
+    pub provider: Option<AiProviderKind>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub clear_api_key: Option<bool>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub timeout_secs: Option<u64>,
+    pub system_prompt: Option<String>,
+    pub enrich_briefing: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AiModelsRequest {
+    pub provider: Option<AiProviderKind>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiModelsResponse {
+    pub ok: bool,
+    pub models: Vec<String>,
+    pub source: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AiTestRequest {
+    pub provider: Option<AiProviderKind>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiTestResponse {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub provider_label: String,
+    pub model: String,
+    pub reply: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AiQueryRequest {
+    pub query: String,
+    pub provider: Option<AiProviderKind>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub external_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AiQueryResponse {
+    pub answer_markdown: String,
+    pub cited_cves: Vec<String>,
+    pub matched_news_count: usize,
+    pub matched_vuln_count: usize,
+    pub analysis_mode: String,
+    pub provider_used: String,
+    pub model_used: String,
+    pub latency_ms: u64,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardKpis {
+    pub total_vulnerabilities: usize,
+    pub critical_count_7d: usize,
+    pub high_count_7d: usize,
+    pub kev_total_catalog: usize,
+    pub kev_tracked: usize,
+    pub kev_added_7d: usize,
+    pub high_epss_count: usize,
+    pub max_epss_pct: f64,
+    pub ai_related_vulns: usize,
+    pub news_count_24h: usize,
+    pub news_count_7d: usize,
+    pub exploit_poc_count: usize,
+    pub botnet_c2_count: usize,
+    pub phishing_total_count: usize,
+    pub compromised_ips_count: usize,
+    pub unacknowledged_alerts: usize,
+    pub feeds_ok: usize,
+    pub feeds_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardPayload {
+    pub ai_brief: AiThreatBrief,
+    pub kpis: DashboardKpis,
+    pub top_vulnerabilities: Vec<Vulnerability>,
+    pub recent_news: Vec<ThreatNewsItem>,
+    pub telemetry: NetworkTelemetry,
+    pub alerts: Vec<ThreatAlert>,
+    pub feed_health: Vec<FeedHealth>,
+    pub last_sweep_at: Option<DateTime<Utc>>,
+    pub next_sweep_at: Option<DateTime<Utc>>,
+    pub poll_interval_secs: u64,
+    pub sweep_in_progress: bool,
+    pub total_sweeps: u64,
+    pub active_ai_provider: String,
+    pub active_ai_model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IocLookupResult {
+    pub query: String,
+    pub matched: bool,
+    pub risk_verdict: String,
+    pub hits: Vec<IocHit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IocHit {
+    pub feed: String,
+    pub indicator_type: String,
+    pub detail: String,
+}
