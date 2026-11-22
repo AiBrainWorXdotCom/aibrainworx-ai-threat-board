@@ -446,6 +446,78 @@ export interface BulkIocResponse {
   results: IocLookupResult[];
 }
 
+export interface PcapEndpointStat {
+  ip: string;
+  packets: number;
+  bytes: number;
+  ports: number[];
+  protocols: string[];
+  is_flagged: boolean;
+  matched_feeds: string[];
+  wireshark_filter: string;
+}
+
+export interface PcapPortStat {
+  port: number;
+  protocol: string;
+  service_name: string;
+  packets: number;
+  unique_hosts: number;
+  is_high_risk: boolean;
+}
+
+export interface PcapHostIndicator {
+  host: string;
+  kind: string;
+  count: number;
+  is_flagged: boolean;
+  matched_feeds: string[];
+  suspicious_reason: string | null;
+  wireshark_filter: string;
+}
+
+export interface PcapMaliciousHit {
+  indicator: string;
+  indicator_type: string;
+  severity: string;
+  feeds: string[];
+  detail: string;
+  packets: number;
+  ports: number[];
+  wireshark_filter: string;
+}
+
+export interface PcapAnomaly {
+  kind: string;
+  severity: string;
+  title: string;
+  detail: string;
+  wireshark_filter: string;
+}
+
+export interface PcapAnalysisReport {
+  filename: string;
+  format: string;
+  file_bytes: number;
+  parse_ms: number;
+  packets_parsed: number;
+  packets_truncated: boolean;
+  total_bytes_observed: number;
+  protocol_counts: Record<string, number>;
+  unique_external_ips: number;
+  unique_internal_ips: number;
+  unique_domains: number;
+  malicious_hits: PcapMaliciousHit[];
+  anomalies: PcapAnomaly[];
+  top_external_ips: PcapEndpointStat[];
+  top_ports: PcapPortStat[];
+  observed_hosts: PcapHostIndicator[];
+  http_user_agents: string[];
+  master_wireshark_filter: string;
+  ai_prompt_summary: string;
+  a2ui?: A2uiSurfacePayload | null;
+}
+
 export interface SnapshotImportResult {
   vulnerabilities_imported: number;
   news_imported: number;

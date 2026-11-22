@@ -1386,6 +1386,315 @@ pub fn build_vuln_triage_a2ui_surface(
         .expect("internal Rust CVE triage A2UI builder always emits a valid payload")
 }
 
+/// Builds a declarative A2UI 1.0 PCAP Incident Surface for offline Wireshark `.pcap`/`.pcapng` triage.
+pub fn build_pcap_a2ui_surface(
+    report: &crate::pcap::PcapAnalysisReport,
+    now: DateTime<Utc>,
+) -> A2uiSurfacePayload {
+    let surface_id = format!("pcap-surface-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let hits_count = report.malicious_hits.len();
+    let crit_hits = report
+        .malicious_hits
+        .iter()
+        .filter(|h| h.severity == "CRITICAL")
+        .count();
+
+    let kpis = vec![
+        json!({
+            "label": "PACKETS PARSED",
+            "value": report.packets_parsed.to_string(),
+            "detail": format!(
+                "{} · {} KB ({} ms){}",
+                report.format,
+                (report.file_bytes / 1024).max(1),
+                report.parse_ms,
+                if report.packets_truncated { " · capped" } else { "" }
+            ),
+            "tone": "cyan",
+        }),
+        json!({
+            "label": "MALICIOUS IOC HITS",
+            "value": hits_count.to_string(),
+            "detail": if crit_hits > 0 {
+                format!("{crit_hits} CRITICAL C2 / threat matches")
+            } else if hits_count > 0 {
+                "Flagged in live public CTI feeds".to_string()
+            } else {
+                "No matches in active blocklists".to_string()
+            },
+            "tone": if hits_count > 0 { "crit" } else { "mint" },
+        }),
+        json!({
+            "label": "EXTERNAL IPs",
+            "value": report.unique_external_ips.to_string(),
+            "detail": format!("{} internal/local hosts observed", report.unique_internal_ips),
+            "tone": if report.unique_external_ips > 0 { "warn" } else { "neutral" },
+        }),
+        json!({
+            "label": "DNS / TLS / HTTP HOSTS",
+            "value": report.unique_domains.to_string(),
+            "detail": format!("{} behavioral anomalies", report.anomalies.len()),
+            "tone": if !report.anomalies.is_empty() { "warn" } else { "mint" },
+        }),
+    ];
+
+    let chart_series: Vec<Value> = if !report.top_ports.is_empty() {
+        report
+            .top_ports
+            .iter()
+            .take(6)
+            .map(|p| {
+                json!({
+                    "name": format!("{}/{}", p.port, p.service_name),
+                    "value": p.packets,
+                    "detail": format!("{} · {} unique hosts{}", p.protocol, p.unique_hosts, if p.is_high_risk { " · HIGH-RISK PORT" } else { "" }),
+                })
+            })
+            .collect()
+    } else {
+        report
+            .protocol_counts
+            .iter()
+            .take(6)
+            .map(|(k, v)| {
+                json!({
+                    "name": k,
+                    "value": v,
+                    "detail": "Observed frame count",
+                })
+            })
+            .collect()
+    };
+
+    let mut playbook: Vec<Value> = Vec::new();
+    if let Some(first_hit) = report.malicious_hits.first() {
+        playbook.push(json!({
+            "id": "pcap-p0-isolate",
+            "priority": "P0",
+            "title": format!(
+                "Inspect {} ({}) frames in Wireshark",
+                clean_text(&first_hit.indicator, 48),
+                first_hit.indicator_type
+            ),
+            "detail": clean_text(&first_hit.detail, 200),
+            "action": {
+                "type": "copy_text",
+                "label": "Copy Wireshark Filter",
+                "text": first_hit.wireshark_filter,
+            },
+        }));
+    }
+    if !report.anomalies.is_empty() {
+        let first_anom = &report.anomalies[0];
+        playbook.push(json!({
+            "id": "pcap-p1-anom",
+            "priority": "P1",
+            "title": clean_text(&first_anom.title, 110),
+            "detail": clean_text(&first_anom.detail, 200),
+            "action": {
+                "type": "copy_text",
+                "label": "Copy Hunt Filter",
+                "text": first_anom.wireshark_filter,
+            },
+        }));
+    }
+    playbook.push(json!({
+        "id": "pcap-p1-master",
+        "priority": if hits_count > 0 { "P0" } else { "P2" },
+        "title": "Isolate all capture hits with the master Wireshark Display Filter",
+        "detail": "Paste directly into Wireshark's display filter bar to inspect full L7 packet payloads and TCP streams.",
+        "action": {
+            "type": "copy_text",
+            "label": "Copy Master Filter",
+            "text": report.master_wireshark_filter,
+        },
+    }));
+    playbook.push(json!({
+        "id": "pcap-p2-blocklist",
+        "priority": "P2",
+        "title": "Export live firewall blocklists (EDL / nftables / pf) & correlate with AI Analyst",
+        "detail": "Push perimeter egress blocks for confirmed C2s and ask AI Threat Analyst for deeper incident context.",
+        "action": {
+            "type": "navigate_tab",
+            "label": "Open AI Analyst",
+            "tab": "analyst",
+        },
+    }));
+
+    let banner = if hits_count > 0 {
+        Some(json!({
+            "tone": "error",
+            "badge": "PCAP THREAT CORRELATION HIT",
+            "title": format!(
+                "{} malicious indicator(s) matched live threat feeds in {}",
+                hits_count,
+                clean_text(&report.filename, 64)
+            ),
+            "body": "Copy the Wireshark Display Filter below to jump directly to the malicious frames in Wireshark, or inspect full indicator rows underneath.",
+            "action": {
+                "type": "copy_text",
+                "label": "Copy Master Wireshark Filter",
+                "text": report.master_wireshark_filter,
+            },
+        }))
+    } else if !report.anomalies.is_empty() {
+        Some(json!({
+            "tone": "warning",
+            "badge": "BEHAVIORAL ANOMALIES DETECTED",
+            "title": format!(
+                "No known blocklist hits, but {} behavioral anomal(ies) flagged in {}",
+                report.anomalies.len(),
+                clean_text(&report.filename, 64)
+            ),
+            "body": "Review port-scan probes, DNS tunneling suspects, or cleartext protocols below.",
+            "action": {
+                "type": "copy_text",
+                "label": "Copy Wireshark Filter",
+                "text": report.master_wireshark_filter,
+            },
+        }))
+    } else {
+        Some(json!({
+            "tone": "success",
+            "badge": "CLEAN AGAINST LIVE FEEDS",
+            "title": format!(
+                "0 live threat-feed matches across {} packets in {}",
+                report.packets_parsed,
+                clean_text(&report.filename, 64)
+            ),
+            "body": "All extracted external IPs, DNS queries, TLS SNIs, and HTTP hosts checked locally in memory with zero external upload.",
+        }))
+    };
+
+    let mut data_model = json!({
+        "generatedAt": now.to_rfc3339(),
+        "kpis": kpis,
+        "chart": { "series": chart_series },
+        "playbook": playbook,
+    });
+    if let Some(b) = banner {
+        data_model["banner"] = b;
+    }
+
+    let mut root_children = vec!["pcap-banner".to_string(), "pcap-kpis".to_string()];
+    let mut components = vec![
+        A2uiComponent {
+            id: "pcap-banner".to_string(),
+            component: "Banner".to_string(),
+            children: None,
+            props: {
+                let mut m = Map::new();
+                m.insert("data".to_string(), path_ref("/banner"));
+                m
+            },
+        },
+        A2uiComponent {
+            id: "pcap-kpis".to_string(),
+            component: "KpiStrip".to_string(),
+            children: None,
+            props: {
+                let mut m = Map::new();
+                m.insert("items".to_string(), path_ref("/kpis"));
+                m
+            },
+        },
+    ];
+
+    let mut split_kids = Vec::new();
+    if !report.top_ports.is_empty() || !report.protocol_counts.is_empty() {
+        split_kids.push("pcap-chart".to_string());
+        let mut m = Map::new();
+        m.insert(
+            "title".to_string(),
+            json!(if !report.top_ports.is_empty() {
+                "Top Destination Ports in Capture"
+            } else {
+                "Observed Protocol Breakdown"
+            }),
+        );
+        m.insert(
+            "subtitle".to_string(),
+            json!("Packet distribution parsed 100% locally in memory (zero tshark)"),
+        );
+        m.insert("unit".to_string(), json!("pkts"));
+        m.insert(
+            "accent".to_string(),
+            json!(if hits_count > 0 { "red" } else { "cyan" }),
+        );
+        m.insert("data".to_string(), path_ref("/chart/series"));
+        components.push(A2uiComponent {
+            id: "pcap-chart".to_string(),
+            component: "BarChart".to_string(),
+            children: None,
+            props: m,
+        });
+    }
+    split_kids.push("pcap-playbook".to_string());
+    {
+        let mut m = Map::new();
+        m.insert(
+            "title".to_string(),
+            json!("Wireshark Incident Containment Checklist"),
+        );
+        m.insert("items".to_string(), path_ref("/playbook"));
+        components.push(A2uiComponent {
+            id: "pcap-playbook".to_string(),
+            component: "ActionChecklist".to_string(),
+            children: None,
+            props: m,
+        });
+    }
+
+    root_children.push("pcap-split".to_string());
+    components.push(A2uiComponent {
+        id: "pcap-split".to_string(),
+        component: "SplitGrid".to_string(),
+        children: Some(split_kids),
+        props: Map::new(),
+    });
+
+    components.insert(
+        0,
+        A2uiComponent {
+            id: "root".to_string(),
+            component: "Column".to_string(),
+            children: Some(root_children),
+            props: Map::new(),
+        },
+    );
+
+    let payload = A2uiSurfacePayload {
+        version: A2UI_PROTOCOL_VERSION.to_string(),
+        surface_id: surface_id.clone(),
+        catalog_id: A2UI_CATALOG_ID.to_string(),
+        intent: "pcap_triage".to_string(),
+        messages: vec![
+            A2uiServerMessage::CreateSurface {
+                surface_id: surface_id.clone(),
+                catalog_id: A2UI_CATALOG_ID.to_string(),
+                root_component_id: "root".to_string(),
+                title: format!("Wireshark {} Triage — {}", report.format, clean_text(&report.filename, 60)),
+                subtitle: format!(
+                    "100% local pure-Rust packet correlation · {} packets · {} external IPs · {} IOC matches",
+                    report.packets_parsed, report.unique_external_ips, hits_count
+                ),
+            },
+            A2uiServerMessage::UpdateDataModel {
+                surface_id: surface_id.clone(),
+                path: "/".to_string(),
+                value: data_model,
+            },
+            A2uiServerMessage::UpdateComponents {
+                surface_id,
+                components,
+            },
+        ],
+    };
+
+    validate_and_sanitize_a2ui(payload)
+        .expect("internal Rust PCAP A2UI builder always emits a valid payload")
+}
+
 /// Optional instruction suffix appended when calling an external LLM so capable models
 /// can optionally tailor the interactive A2UI headline/banner/playbook while keeping all
 /// CVE telemetry strictly Rust-verified.

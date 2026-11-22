@@ -2,7 +2,7 @@
 
 ## Threat Model & Local-First Posture
 
-**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.4.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, declarative zero-HTML agentic UI, SSRF containment, credential isolation, and untrusted telemetry sanitization:
+**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.5.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, declarative zero-HTML agentic UI, memory-safe offline packet triage, SSRF containment, credential isolation, and untrusted telemetry sanitization:
 
 1. **Local Argon2id Authentication, Ephemeral Sessions & Offline TOTP 2FA:**
    - Authentication is enabled by default even on `127.0.0.1:8080`. On first run, the browser opens the **First-Run Admin Setup** wizard (`POST /api/auth/setup`, permanently locked with `403` once an account exists).
@@ -37,7 +37,12 @@
    - **Anti-DoS & Sanitization:** `validate_and_sanitize_a2ui` enforces protocol version (`1.0`), trusted catalog ID (`aibrainworx.soc.v1`), maximum component count (`40`), recursion depth (`8`), acyclic component graph verification, invisible-Unicode stripping, and `javascript:`/`data:`/`vbscript:` URI blocking. External LLMs may only supply validated `a2ui-patch` text/playbook hints while all CVE and network metrics stay Rust-verified in `dataModel`.
    - **OPSEC Parity:** `A2uiRenderer` honors **OPSEC Redact Mode** across KPI subtitles, banners, advisories, botnet C2 IPs/hostnames, copy actions, and raw `A2UI JSON` previews.
 
-7. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
+7. **Memory-Safe Offline Wireshark `.pcap`/`.pcapng` Triage (`backend/src/pcap.rs`):**
+   - **Zero `unsafe`, Zero `tshark`, Zero Root:** Captures are decoded entirely in pure memory-safe Rust with checked slice indexing — no live promiscuous sniffing, no `Npcap` driver install, and no shelling out to C-based `tshark` dissectors on untrusted captures.
+   - **RAM-Only & Strict Anti-DoS Bounds:** Raw capture bytes are parsed strictly in memory and never persisted to SQLite or disk. Endpoints enforce a scoped `25 MB` Axum body limit (`POST /api/iocs/pcap`), `250,000` max packets per capture, `5,000` unique endpoint/domain caps, 16-hop DNS compression-pointer loop guards, and `403 Forbidden` in `--wallboard` read-only mode.
+   - **OPSEC Masking Parity:** When **OPSEC Redact Mode** is active, extracted PCAP IPs, observed hostnames/SNIs, DNS anomaly strings, and rendered/copied Wireshark display filters are automatically masked (`198.51.xxx.xxx`, `"••••.invalid"`).
+
+8. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
    - **OPSEC Redact Mode** masks public attacker IPs, C2 endpoints, and phishing domains in the UI for safe screen-sharing and demos.
    - Phishing URLs render defanged (`hxxps://`, `[.]`) as non-clickable text.
    - Spreadsheet CSV exports escape leading `=`, `+`, `-`, `@`, `\t`, and `\r` characters to neutralize formula injection.

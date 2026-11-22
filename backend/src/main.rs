@@ -5,6 +5,7 @@ mod auth;
 mod export;
 mod feeds;
 mod models;
+mod pcap;
 mod routes;
 mod security;
 mod stack;

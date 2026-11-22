@@ -373,8 +373,42 @@ pub fn export_iocs_blocklist(
             }
             Ok((body, "text/csv; charset=utf-8", "aibrainworx-iocs.csv"))
         }
+        "wireshark" | "ws" => {
+            let v4_ips: Vec<String> = unique_ips
+                .iter()
+                .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                .take(150)
+                .cloned()
+                .collect();
+            let top_ports: Vec<String> = telemetry
+                .top_attacked_ports
+                .iter()
+                .take(6)
+                .map(|p| p.port.to_string())
+                .collect();
+            let mut clauses = Vec::new();
+            if !v4_ips.is_empty() {
+                clauses.push(format!("ip.addr in {{{}}}", v4_ips.join(" ")));
+            }
+            if !top_ports.is_empty() {
+                clauses.push(format!("tcp.port in {{{}}}", top_ports.join(" ")));
+            }
+            let filter_expr = if clauses.is_empty() {
+                "tcp.flags.syn == 1 && tcp.flags.ack == 0".to_string()
+            } else {
+                clauses.join(" || ")
+            };
+            let body = format!(
+                "# AiBrainWorX Threat Board — Wireshark Display Filter\n# Paste the line below directly into Wireshark's display filter bar:\n\n{filter_expr}\n"
+            );
+            Ok((
+                body,
+                "text/plain; charset=utf-8",
+                "aibrainworx-wireshark-filter.txt",
+            ))
+        }
         other => Err(format!(
-            "Unsupported IOC export format '{other}'; expected edl, pf, nftables, or csv"
+            "Unsupported IOC export format '{other}'; expected edl, pf, nftables, csv, or wireshark"
         )),
     }
 }

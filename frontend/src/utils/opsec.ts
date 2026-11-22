@@ -78,7 +78,20 @@ export function redactUrl(rawUrl: string, opsec: boolean): string {
 
 export function redactDisplayText(text: string, opsec: boolean): string {
   if (!opsec || !text) return text;
-  return text.replace(IPV4_REGEX, (m) => redactIp(m));
+  let out = text.replace(IPV4_REGEX, (m) => redactIp(m));
+  // Redact long high-entropy / explicit DNS hostnames in suspicious query callouts
+  out = out.replace(
+    /(Suspicious DNS query:\s*)([a-z0-9._-]+\.[a-z]{2,})/gi,
+    (_m, prefix: string, host: string) => `${prefix}${redactHostname(host)}`
+  );
+  return out;
+}
+
+export function redactWiresharkFilter(filter: string, opsec: boolean): string {
+  if (!opsec || !filter) return filter;
+  let out = filter.replace(IPV4_REGEX, (m) => redactIp(m));
+  out = out.replace(/"([^"]+)"/g, (_m, inner: string) => `"${redactHostname(inner)}"`);
+  return out;
 }
 
 /**

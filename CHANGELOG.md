@@ -2,6 +2,14 @@
 
 All notable changes to **AiBrainWorX AI CyberSecurity Threat Analysis Board** are documented here.
 
+## v0.5.0 (2026-11-22)
+
+### Wireshark Offline `.pcap` / `.pcapng` Threat Triage & Display Filters
+- **Zero-Dependency Pure-Rust PCAP/PCAPNG Parser (`backend/src/pcap.rs`):** Parses classic `.pcap` (LE/BE, µs/ns) and modern Wireshark `.pcapng` (SHB, IDB, EPB, SPB) strictly in memory with zero `unsafe`, zero `tshark`, zero Npcap/root, `25 MB` max upload cap, `250,000` packet cap, and 16-hop DNS compression-pointer loop protection.
+- **L2–L7 Protocol Extraction & Live CTI Correlation:** Decodes Ethernet (+ 802.1Q VLAN), Linux SLL/SLL2, Raw IP, Loopback → IPv4/IPv6 → TCP/UDP → DNS `QNAME`, TLS ClientHello SNI, and cleartext HTTP `Host`/`User-Agent`, cross-checking every extracted indicator against live Feodo Botnet C2s, SANS ISC Top Attackers, Emerging Threats Compromised IPs, and OpenPhish domains.
+- **Behavioral Heuristics & A2UI 1.0 PCAP Incident Surface:** Detects SYN port scans, high-entropy DNS tunneling suspects, and cleartext FTP/Telnet/HTTP protocols; renders results as an interactive A2UI 1.0 surface (KPI strip, Top Destination Ports Recharts bar chart, containment checklist) plus Flagged Hits, Observed Hosts, and Top External Talkers tables inside **Network IOCs**.
+- **One-Click Wireshark Display Filters & AI Analyst Handoff:** Added `GET /api/iocs/wireshark-filter`, `GET /api/iocs/export?format=wireshark`, `POST /api/iocs/pcap`, `POST /api/iocs/pcap/sample` (1-click real binary `.pcap` test + Demo Mode support), per-row `Copy WS Filter` buttons across Feodo C2s and PCAP hits, full OPSEC IP & domain masking (`redactWiresharkFilter`), and one-click **`Analyze PCAP with AI Analyst`** handoff.
+
 ## v0.4.0 (2026-11-22)
 
 ### A2UI 1.0 Interactive SOC Surfaces

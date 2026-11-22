@@ -16,6 +16,7 @@ import type {
   MyStackConfig,
   MyStackPayload,
   MyStackUpdateRequest,
+  PcapAnalysisReport,
   SnapshotImportResult,
   StackComponent,
   StackImportResponse,
@@ -855,6 +856,221 @@ export const demoApi = {
       checked: results.length,
       matched_count: results.filter((r) => r.matched).length,
       results,
+    };
+  },
+
+  getWiresharkFilter: async () => ({
+    filter:
+      'ip.addr in {198.51.100.42 203.0.113.108 192.0.2.55} || tcp.port in {443 22 23 8080}',
+    c2_count: INITIAL_TELEMETRY.botnet_c2s.length,
+    attacker_count: INITIAL_TELEMETRY.top_attacking_ips.length,
+  }),
+
+  analyzePcapSample: async (filename = 'aibrainworx-demo-capture.pcap'): Promise<PcapAnalysisReport> => {
+    const surfaceId = `demo-pcap-${Date.now()}`;
+    const masterFilter =
+      '(ip.addr == 198.51.100.42 && (tcp.port == 443 || udp.port == 443)) || (dns.qry.name contains "sso-verify-portal.invalid" || tls.handshake.extensions_server_name contains "sso-verify-portal.invalid" || http.host contains "sso-verify-portal.invalid")';
+    return {
+      filename,
+      format: 'PCAP',
+      file_bytes: 3420,
+      parse_ms: 2,
+      packets_parsed: 19,
+      packets_truncated: false,
+      total_bytes_observed: 3012,
+      protocol_counts: { TCP: 17, UDP: 2, TLS: 4, DNS: 2, HTTP: 1 },
+      unique_external_ips: 3,
+      unique_internal_ips: 1,
+      unique_domains: 2,
+      malicious_hits: [
+        {
+          indicator: '198.51.100.42',
+          indicator_type: 'Botnet C2',
+          severity: 'CRITICAL',
+          feeds: ['abuse.ch Feodo Tracker (Demo)'],
+          detail: 'Botnet C2 (QakBot, port 443, XX)',
+          packets: 16,
+          ports: [443, 22, 23, 445, 3389],
+          wireshark_filter: 'ip.addr == 198.51.100.42 && (tcp.port == 443 || udp.port == 443)',
+        },
+        {
+          indicator: 'sso-verify-portal.invalid',
+          indicator_type: 'Phishing Domain',
+          severity: 'HIGH',
+          feeds: ['OpenPhish (Demo)'],
+          detail: 'Active phishing campaign domain (Enterprise SSO Demo)',
+          packets: 6,
+          ports: [],
+          wireshark_filter:
+            'dns.qry.name contains "sso-verify-portal.invalid" || tls.handshake.extensions_server_name contains "sso-verify-portal.invalid" || http.host contains "sso-verify-portal.invalid"',
+        },
+      ],
+      anomalies: [
+        {
+          kind: 'PORT_SCAN',
+          severity: 'HIGH',
+          title: 'Port scan / SYN sweep detected from 198.51.100.42 (12 distinct ports)',
+          detail: '12 TCP SYN probes across 12 destination port(s) and 1 target host(s).',
+          wireshark_filter: 'ip.src == 198.51.100.42 && tcp.flags.syn == 1 && tcp.flags.ack == 0',
+        },
+        {
+          kind: 'DNS_TUNNELING',
+          severity: 'MEDIUM',
+          title: 'Suspicious DNS query: 9a8f7e6d5c4b3a291807f6e5d4c3b2a19f8e7d6c.exfil-beacon.invalid',
+          detail: 'High-entropy long subdomain (40 chars, entropy 3.92) — possible DNS tunneling/DGA',
+          wireshark_filter:
+            'dns.qry.name == "9a8f7e6d5c4b3a291807f6e5d4c3b2a19f8e7d6c.exfil-beacon.invalid"',
+        },
+      ],
+      top_external_ips: [
+        {
+          ip: '198.51.100.42',
+          packets: 16,
+          bytes: 2140,
+          ports: [443, 22, 23, 445, 3389],
+          protocols: ['TCP', 'TLS'],
+          is_flagged: true,
+          matched_feeds: ['abuse.ch Feodo Tracker (Demo)'],
+          wireshark_filter: 'ip.addr == 198.51.100.42 && (tcp.port == 443 || udp.port == 443)',
+        },
+        {
+          ip: '192.0.2.80',
+          packets: 1,
+          bytes: 184,
+          ports: [80],
+          protocols: ['TCP', 'HTTP'],
+          is_flagged: false,
+          matched_feeds: [],
+          wireshark_filter: 'ip.addr == 192.0.2.80 && (tcp.port == 80 || udp.port == 80)',
+        },
+      ],
+      top_ports: [
+        { port: 443, protocol: 'TCP', service_name: 'HTTPS', packets: 5, unique_hosts: 2, is_high_risk: false },
+        { port: 53, protocol: 'UDP', service_name: 'DNS', packets: 2, unique_hosts: 1, is_high_risk: false },
+        { port: 80, protocol: 'TCP', service_name: 'HTTP', packets: 2, unique_hosts: 2, is_high_risk: false },
+        { port: 445, protocol: 'TCP', service_name: 'SMB', packets: 1, unique_hosts: 1, is_high_risk: true },
+        { port: 3389, protocol: 'TCP', service_name: 'RDP', packets: 1, unique_hosts: 1, is_high_risk: true },
+      ],
+      observed_hosts: [
+        {
+          host: 'sso-verify-portal.invalid',
+          kind: 'TLS SNI',
+          count: 6,
+          is_flagged: true,
+          matched_feeds: ['OpenPhish (Demo)'],
+          suspicious_reason: null,
+          wireshark_filter:
+            'dns.qry.name contains "sso-verify-portal.invalid" || tls.handshake.extensions_server_name contains "sso-verify-portal.invalid" || http.host contains "sso-verify-portal.invalid"',
+        },
+        {
+          host: '9a8f7e6d5c4b3a291807f6e5d4c3b2a19f8e7d6c.exfil-beacon.invalid',
+          kind: 'DNS',
+          count: 1,
+          is_flagged: false,
+          matched_feeds: [],
+          suspicious_reason: 'High-entropy long subdomain (40 chars) — possible DNS tunneling/DGA',
+          wireshark_filter:
+            'dns.qry.name contains "9a8f7e6d5c4b3a291807f6e5d4c3b2a19f8e7d6c.exfil-beacon.invalid"',
+        },
+      ],
+      http_user_agents: ['Mozilla/5.0 (Sample-SOC-Probe)'],
+      master_wireshark_filter: masterFilter,
+      ai_prompt_summary: `Analyze this offline Wireshark PCAP capture (${filename}): 19 packets parsed, 3 external IPs, 2 observed DNS/TLS/HTTP hosts, 2 live threat-feed IOC matches (198.51.100.42 [Botnet C2], sso-verify-portal.invalid [Phishing Domain]), and 2 behavioral anomalies (PORT_SCAN, DNS_TUNNELING).`,
+      a2ui: {
+        version: '1.0',
+        surface_id: surfaceId,
+        catalog_id: 'aibrainworx.soc.v1',
+        intent: 'pcap_triage',
+        messages: [
+          {
+            type: 'createSurface',
+            surfaceId,
+            catalogId: 'aibrainworx.soc.v1',
+            rootComponentId: 'root',
+            title: `Wireshark PCAP Triage — ${filename}`,
+            subtitle: '100% local pure-Rust packet correlation (Synthetic RFC-5737 Demo)',
+          },
+          {
+            type: 'updateDataModel',
+            surfaceId,
+            path: '/',
+            value: {
+              banner: {
+                tone: 'error',
+                badge: 'PCAP THREAT CORRELATION HIT',
+                title: `2 malicious indicators matched live threat feeds in ${filename}`,
+                body: 'Copy the Wireshark Display Filter below to isolate C2 and phishing frames directly in Wireshark.',
+                action: { type: 'copy_text', label: 'Copy Master Filter', text: masterFilter },
+              },
+              kpis: [
+                { label: 'PACKETS PARSED', value: '19', detail: 'PCAP · 3 KB (2 ms)', tone: 'cyan' },
+                { label: 'MALICIOUS IOC HITS', value: '2', detail: '1 CRITICAL C2 · 1 Phishing', tone: 'crit' },
+                { label: 'EXTERNAL IPs', value: '3', detail: '1 internal host observed', tone: 'warn' },
+                { label: 'DNS / TLS / HTTP HOSTS', value: '2', detail: '2 behavioral anomalies', tone: 'warn' },
+              ],
+              chart: {
+                series: [
+                  { name: '443/HTTPS', value: 5, detail: 'TCP · 2 hosts' },
+                  { name: '53/DNS', value: 2, detail: 'UDP · 1 host' },
+                  { name: '80/HTTP', value: 2, detail: 'TCP · 2 hosts' },
+                  { name: '445/SMB', value: 1, detail: 'TCP · HIGH-RISK PORT' },
+                  { name: '3389/RDP', value: 1, detail: 'TCP · HIGH-RISK PORT' },
+                ],
+              },
+              playbook: [
+                {
+                  id: 'demo-ws-p0',
+                  priority: 'P0',
+                  title: 'Inspect 198.51.100.42 (Botnet C2) frames in Wireshark',
+                  detail: 'Matched Feodo Tracker QakBot C2 on port 443.',
+                  action: {
+                    type: 'copy_text',
+                    label: 'Copy Wireshark Filter',
+                    text: 'ip.addr == 198.51.100.42 && (tcp.port == 443 || udp.port == 443)',
+                  },
+                },
+                {
+                  id: 'demo-ws-p1',
+                  priority: 'P1',
+                  title: 'Investigate SYN port scan & high-entropy DNS tunneling query',
+                  detail: '12 destination ports probed alongside suspicious exfil-beacon subdomain.',
+                  action: {
+                    type: 'copy_text',
+                    label: 'Copy Hunt Filter',
+                    text: 'ip.src == 198.51.100.42 && tcp.flags.syn == 1 && tcp.flags.ack == 0',
+                  },
+                },
+              ],
+            },
+          },
+          {
+            type: 'updateComponents',
+            surfaceId,
+            components: [
+              { id: 'root', component: 'Column', children: ['pcap-banner', 'pcap-kpis', 'pcap-split'] },
+              { id: 'pcap-banner', component: 'Banner', props: { data: { '@path': '/banner' } } },
+              { id: 'pcap-kpis', component: 'KpiStrip', props: { items: { '@path': '/kpis' } } },
+              { id: 'pcap-split', component: 'SplitGrid', children: ['pcap-chart', 'pcap-playbook'] },
+              {
+                id: 'pcap-chart',
+                component: 'BarChart',
+                props: {
+                  title: 'Top Destination Ports in Capture',
+                  subtitle: 'Synthetic RFC-5737 PCAP demo profile',
+                  unit: 'pkts',
+                  accent: 'red',
+                  data: { '@path': '/chart/series' },
+                },
+              },
+              {
+                id: 'pcap-playbook',
+                component: 'ActionChecklist',
+                props: { title: 'Wireshark Incident Containment Checklist', items: { '@path': '/playbook' } },
+              },
+            ],
+          },
+        ],
+      },
     };
   },
 

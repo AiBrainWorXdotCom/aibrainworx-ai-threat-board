@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useToast } from '@astryxdesign/core';
 import { Badge } from '@astryxdesign/core/Badge';
 import { Button } from '@astryxdesign/core/Button';
@@ -17,6 +17,8 @@ interface AiAnalystViewProps {
   activeModel: string;
   opsecMode?: boolean;
   readOnly?: boolean;
+  pendingPrompt?: string | null;
+  onConsumePendingPrompt?: () => void;
   onSelectVulnId: (id: string) => void;
   onNavigate?: (tab: NavTab) => void;
   onTriageUpdated?: () => void;
@@ -46,6 +48,8 @@ export function AiAnalystView({
   activeModel,
   opsecMode = false,
   readOnly = false,
+  pendingPrompt = null,
+  onConsumePendingPrompt,
   onSelectVulnId,
   onNavigate,
   onTriageUpdated,
@@ -56,6 +60,7 @@ export function AiAnalystView({
   const [loading, setLoading] = useState(false);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const consumedPromptRef = useRef<string | null>(null);
 
   const submitQuery = async (promptText?: string) => {
     const q = (promptText ?? query).trim();
@@ -80,6 +85,15 @@ export function AiAnalystView({
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (pendingPrompt && pendingPrompt !== consumedPromptRef.current && !readOnly) {
+      consumedPromptRef.current = pendingPrompt;
+      onConsumePendingPrompt?.();
+      void submitQuery(pendingPrompt);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPrompt, readOnly]);
 
   const setTurnViewMode = (turnId: string, mode: TurnViewMode) => {
     setTurns((prev) => prev.map((t) => (t.id === turnId ? { ...t, viewMode: mode } : t)));

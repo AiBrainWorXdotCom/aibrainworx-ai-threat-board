@@ -85,6 +85,8 @@ pub fn api_router(state: AppState) -> Router {
         .route("/iocs", get(get_iocs))
         .route("/iocs/bulk", post(bulk_lookup_iocs))
         .route("/iocs/export", get(export_iocs))
+        .route("/iocs/wireshark-filter", get(get_wireshark_filter))
+        .route("/iocs/pcap/sample", post(analyze_pcap_sample))
         .route("/alerts", get(list_alerts))
         .route("/alerts/ack-all", post(ack_all_alerts))
         .route("/alerts/test", post(trigger_test_alert))
@@ -123,6 +125,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/snapshot/import",
             post(import_snapshot).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
+        )
+        .route(
+            "/iocs/pcap",
+            post(analyze_pcap_upload).layer(DefaultBodyLimit::max(crate::pcap::MAX_PCAP_BYTES)),
         );
 
     standard.merge(large_uploads).with_state(state)
@@ -1958,6 +1964,62 @@ async fn export_iocs(
         }
         Err(msg) => (
             StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PcapUploadQuery {
+    filename: Option<String>,
+}
+
+async fn get_wireshark_filter(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.store.read().await;
+    let filter = crate::pcap::build_live_telemetry_wireshark_filter(&store);
+    Json(serde_json::json!({
+        "filter": filter,
+        "c2_count": store.telemetry.botnet_c2s.len(),
+        "attacker_count": store.telemetry.top_attacking_ips.len().min(25),
+    }))
+}
+
+async fn analyze_pcap_upload(
+    State(state): State<AppState>,
+    Query(params): Query<PcapUploadQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    let filename = params
+        .filename
+        .as_deref()
+        .unwrap_or("capture.pcap")
+        .to_string();
+    let store = state.store.read().await;
+    match crate::pcap::analyze_pcap_bytes(&filename, &body, &store) {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn analyze_pcap_sample(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    let store = state.store.read().await;
+    let sample_bytes = crate::pcap::build_synthetic_sample_pcap(&store);
+    match crate::pcap::analyze_pcap_bytes("aibrainworx-sample-incident.pcap", &sample_bytes, &store)
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": msg })),
         )
             .into_response(),

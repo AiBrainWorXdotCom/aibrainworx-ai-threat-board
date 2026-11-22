@@ -21,6 +21,7 @@ import type {
   MyStackPayload,
   MyStackUpdateRequest,
   NetworkTelemetry,
+  PcapAnalysisReport,
   SnapshotImportResult,
   StackImportResponse,
   ThreatAlert,
@@ -349,7 +350,7 @@ export const api = {
           body: JSON.stringify({ indicators }),
         }),
 
-  exportIocs: async (format: 'edl' | 'nftables' | 'pf' | 'csv') => {
+  exportIocs: async (format: 'edl' | 'nftables' | 'pf' | 'csv' | 'wireshark') => {
     if (IS_DEMO_MODE) {
       const { telemetry } = await demoApi.getDashboard();
       const ips = Array.from(
@@ -358,7 +359,13 @@ export const api = {
           ...telemetry.top_attacking_ips.map((i) => i.ip),
         ])
       );
-      if (format === 'nftables') {
+      if (format === 'wireshark') {
+        const filter = ips.length > 0 ? `ip.addr in {${ips.join(' ')}}` : 'tcp.flags.syn == 1';
+        downloadTextFile(
+          'aibrainworx-demo-wireshark-filter.txt',
+          `# AiBrainWorX Demo Wireshark Display Filter\n${filter}\n`
+        );
+      } else if (format === 'nftables') {
         downloadTextFile(
           'aibrainworx-demo-nftables.nft',
           `set aibrainworx_blocklist {\n  type ipv4_addr\n  elements = { ${ips.join(', ')} }\n}\n`
@@ -370,6 +377,51 @@ export const api = {
     }
     return downloadEndpointFile(`/api/iocs/export?format=${format}`, `aibrainworx-iocs.${format}`);
   },
+
+  getWiresharkFilter: async (): Promise<{
+    filter: string;
+    c2_count: number;
+    attacker_count: number;
+  }> =>
+    IS_DEMO_MODE
+      ? demoApi.getWiresharkFilter()
+      : fetchJson<{ filter: string; c2_count: number; attacker_count: number }>(
+          '/api/iocs/wireshark-filter'
+        ),
+
+  analyzePcapFile: async (file: File): Promise<PcapAnalysisReport> => {
+    if (IS_DEMO_MODE) return demoApi.analyzePcapSample(file.name);
+    const bytes = await file.arrayBuffer();
+    const res = await fetch(
+      `/api/iocs/pcap?filename=${encodeURIComponent(file.name || 'capture.pcap')}`,
+      {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: bytes,
+      }
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      let message = `PCAP analysis failed (${res.status})`;
+      try {
+        const parsed = JSON.parse(txt) as { error?: string };
+        if (parsed.error) message = parsed.error;
+      } catch {
+        if (txt) message = txt;
+      }
+      throw new ApiError(message, res.status);
+    }
+    return res.json() as Promise<PcapAnalysisReport>;
+  },
+
+  analyzePcapSample: async (): Promise<PcapAnalysisReport> =>
+    IS_DEMO_MODE
+      ? demoApi.analyzePcapSample('aibrainworx-demo-capture.pcap')
+      : fetchJson<PcapAnalysisReport>('/api/iocs/pcap/sample', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        }),
 
   getAlerts: async () => {
     if (IS_DEMO_MODE) {

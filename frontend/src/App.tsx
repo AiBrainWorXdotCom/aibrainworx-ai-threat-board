@@ -58,6 +58,7 @@ function DashboardWorkspace({
     }
   });
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [pendingAnalystPrompt, setPendingAnalystPrompt] = useState<string | null>(null);
   const [securityModalOpen, setSecurityModalOpen] = useState(false);
 
   const [drawerVulnId, setDrawerVulnId] = useState<string | null>(null);
@@ -518,7 +519,13 @@ function DashboardWorkspace({
                 <NetworkIocView
                   telemetry={dashboard.telemetry}
                   opsecMode={opsecMode}
+                  readOnly={serverWallboard}
                   onSelectVulnId={handleSelectVulnId}
+                  onNavigate={setActiveTab}
+                  onAskAnalyst={(prompt) => {
+                    setPendingAnalystPrompt(prompt);
+                    setActiveTab('analyst');
+                  }}
                 />
               )}
               {activeTab === 'analyst' && (
@@ -527,6 +534,8 @@ function DashboardWorkspace({
                   activeModel={dashboard.active_ai_model}
                   opsecMode={opsecMode}
                   readOnly={serverWallboard}
+                  pendingPrompt={pendingAnalystPrompt}
+                  onConsumePendingPrompt={() => setPendingAnalystPrompt(null)}
                   onSelectVulnId={handleSelectVulnId}
                   onNavigate={setActiveTab}
                   onTriageUpdated={() => void loadDashboard()}
