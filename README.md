@@ -199,10 +199,10 @@ Aggregated multi-source feed cards from CISA Advisories, BleepingComputer, The H
 
 ![News Advisories and Exploit Wire](docs/screenshots/05-news-advisories.png)
 
-### 6. Network IOCs & Live Indicator Lookup
-Instant IPv4, hostname, and phishing domain verifier cross-checking SANS ISC top attackers, abuse.ch Feodo botnet C2s, OpenPhish active campaigns, Emerging Threats compromised hosts, and FIRST.org top EPSS probabilities.
+### 6. Network IOCs, Firewall Blocklists & OPSEC Redact Mode
+Instant IPv4, hostname, and phishing domain verifier cross-checking SANS ISC top attackers, abuse.ch Feodo botnet C2s, OpenPhish active campaigns, Emerging Threats compromised hosts, and FIRST.org top EPSS probabilities — with one-click **OPSEC Redact Mode** and **EDL / nftables / pf / CSV** firewall exports.
 
-![Network IOCs and Live Lookup](docs/screenshots/06-network-iocs.png)
+![Network IOCs and OPSEC Redact Mode](docs/screenshots/06-network-iocs.png)
 
 ### 7. AI Threat Analyst Console
 Interactive natural-language threat hunting console correlating live CVEs, CISA KEVs, exploit PoCs, and network sensors with clickable cited CVE drilldowns.
@@ -210,14 +210,19 @@ Interactive natural-language threat hunting console correlating live CVEs, CISA 
 ![AI Threat Analyst Console](docs/screenshots/07-ai-threat-analyst.png)
 
 ### 8. Universal AI Provider & Local Model Hub (13 Providers)
-Unified configuration hub supporting local engines (Built-in Rust Engine, Ollama live discovery, LM Studio, llama.cpp/vLLM) and cloud APIs (OpenAI, Anthropic Claude, Google Gemini, OpenRouter, Groq, DeepSeek, Mistral, xAI, Custom OpenAI-Compatible) with connection testing and session-only API keys.
+Unified configuration hub supporting local engines (Built-in Rust Engine, Ollama live discovery, LM Studio, llama.cpp/vLLM) and cloud APIs (OpenAI, Anthropic Claude, Google Gemini, OpenRouter, Groq, DeepSeek, Mistral, xAI, Custom OpenAI-Compatible) with connection testing, opt-in OS Keychain storage, and SSRF-protected LAN controls.
 
 ![Universal AI Provider and Local Model Hub](docs/screenshots/08-ai-models-hub.png)
 
-### 9. Real-Time Alerts, Hourly Watchdog & Feed Health Matrix
-Configurable severity/keyword/KEV alerting rules, live SSE test simulation, acknowledge controls, and per-feed HTTP status, latency, and record telemetry across all 25 public sources.
+### 9. Outbound Signed Webhooks, BYO Custom Feeds & Air-Gapped Snapshots
+SSRF-pinned HMAC-signed Slack/Discord/Teams/Generic alert webhooks, BYO custom RSS/STIX/IOC feed ingestion, SHA-256 verified secret-stripped offline snapshot export/import, and per-feed HTTP health telemetry across all 25 public sources.
 
-![Feeds and Alerts Watchdog](docs/screenshots/09-feeds-alerts.png)
+![Feeds, Webhooks, and Air-Gapped Snapshots](docs/screenshots/09-feeds-alerts.png)
+
+### 10. My Stack — 100% Local SBOM & Watchlist Correlator
+Drop or paste CycloneDX, SPDX, `package-lock.json`, `Cargo.lock`, `requirements.txt`, `go.mod`, or `pom.xml` plus watched infrastructure vendors to correlate exposed CVEs and active CISA KEVs completely locally in Rust.
+
+![My Stack Local SBOM Correlator](docs/screenshots/10-my-stack-sbom.png)
 
 ---
 
