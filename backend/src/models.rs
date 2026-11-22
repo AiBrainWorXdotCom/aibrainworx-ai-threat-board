@@ -869,20 +869,84 @@ pub struct ServerModeInfo {
     pub version: String,
     pub wallboard_mode: bool,
     pub offline_mode: bool,
+    pub no_auth_mode: bool,
     pub auth_required: bool,
+    pub setup_required: bool,
     pub authenticated: bool,
+    pub username: Option<String>,
+    pub totp_enabled: bool,
     pub bind_addr: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthStatusResponse {
     pub auth_required: bool,
+    pub setup_required: bool,
     pub authenticated: bool,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub totp_enabled: bool,
+    pub recovery_codes_remaining: usize,
+    pub token_auth_enabled: bool,
     pub wallboard_mode: bool,
     pub offline_mode: bool,
+    pub no_auth_mode: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthSetupRequest {
+    pub username: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthLoginRequest {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub totp_code: String,
+    #[serde(default)]
+    pub remember_me: bool,
+    #[serde(default)]
     pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TotpEnrollResponse {
+    pub secret_b32: String,
+    pub otpauth_uri: String,
+    pub qr_svg_data_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TotpVerifyRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TotpDisableRequest {
+    pub password: String,
+    #[serde(default)]
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthSessionPublic {
+    pub id_preview: String,
+    pub username: String,
+    pub user_agent: String,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub is_current: bool,
 }

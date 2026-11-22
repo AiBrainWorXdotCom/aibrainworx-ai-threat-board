@@ -593,9 +593,16 @@ function buildDemoFeedHealth(): FeedHealth[] {
 export const demoApi = {
   getAuthStatus: async (): Promise<AuthStatusResponse> => ({
     auth_required: false,
+    setup_required: false,
     authenticated: true,
+    username: 'demo-analyst',
+    display_name: 'Demo Analyst',
+    totp_enabled: false,
+    recovery_codes_remaining: 0,
+    token_auth_enabled: false,
     wallboard_mode: false,
     offline_mode: false,
+    no_auth_mode: true,
   }),
 
   getDashboard: async (): Promise<DashboardPayload> => {
@@ -712,8 +719,12 @@ export const demoApi = {
         version: '0.2.0-demo',
         wallboard_mode: false,
         offline_mode: false,
+        no_auth_mode: true,
         auth_required: false,
+        setup_required: false,
         authenticated: true,
+        username: 'demo-analyst',
+        totp_enabled: false,
         bind_addr: 'static-pages',
       },
     };

@@ -7,8 +7,10 @@ import {
   BellRing,
   Eye,
   EyeOff,
+  LogOut,
   Moon,
   RefreshCw,
+  ShieldCheck,
   Sun,
   Volume2,
   VolumeX,
@@ -31,6 +33,9 @@ interface TopCommandBarProps {
   opsecMode: boolean;
   wallboardMode: boolean;
   offlineMode: boolean;
+  authRequired: boolean;
+  username: string | null;
+  totpEnabled: boolean;
   onToggleSound: () => void;
   onToggleDarkMode: () => void;
   onToggleOpsecMode: () => void;
@@ -38,6 +43,8 @@ interface TopCommandBarProps {
   onRefreshNow: () => void;
   onOpenAlerts: () => void;
   onOpenAiModels: () => void;
+  onOpenSecurity: () => void;
+  onLogout: () => void;
 }
 
 function formatCountdown(targetIso: string | null, nowMs: number): string {
@@ -64,6 +71,9 @@ export function TopCommandBar({
   opsecMode,
   wallboardMode,
   offlineMode,
+  authRequired,
+  username,
+  totpEnabled,
   onToggleSound,
   onToggleDarkMode,
   onToggleOpsecMode,
@@ -71,6 +81,8 @@ export function TopCommandBar({
   onRefreshNow,
   onOpenAlerts,
   onOpenAiModels,
+  onOpenSecurity,
+  onLogout,
 }: TopCommandBarProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -254,6 +266,31 @@ export function TopCommandBar({
           icon={darkMode ? <Sun size={14} /> : <Moon size={14} />}
           onClick={onToggleDarkMode}
         />
+
+        {!IS_DEMO_MODE && authRequired && (
+          <>
+            <Button
+              label={username ? `@${username}` : 'Security'}
+              variant="secondary"
+              size="sm"
+              icon={<ShieldCheck size={13} color={totpEnabled ? '#66efab' : '#94a3b8'} />}
+              endContent={
+                totpEnabled ? <Badge variant="success" label="2FA" /> : undefined
+              }
+              tooltip="Account Security, TOTP 2FA & Active Sessions"
+              onClick={onOpenSecurity}
+            />
+            <Button
+              label="Lock"
+              variant="secondary"
+              size="sm"
+              isIconOnly
+              tooltip="Lock & Sign Out"
+              icon={<LogOut size={14} />}
+              onClick={onLogout}
+            />
+          </>
+        )}
       </div>
     </header>
   );

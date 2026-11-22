@@ -22,6 +22,12 @@ use crate::ai_providers::{
     list_models, provider_display_name, test_connection, to_public_config,
 };
 use crate::analyzer::{answer_analyst_query, generate_ai_brief, triage_vulnerability_with_ai};
+use crate::auth::{
+    build_otpauth_uri, consume_recovery_code, dummy_verify_password, generate_recovery_codes,
+    generate_session_token, generate_totp_secret, hash_password, hash_secret_sha256,
+    render_qr_svg_data_uri, validate_password, validate_username, verify_password,
+    verify_totp_code,
+};
 use crate::export::{
     build_offline_snapshot, export_iocs_blocklist, export_stix_bundle, export_vulnerabilities_csv,
     export_vulnerability_markdown, verify_offline_snapshot,
@@ -29,19 +35,21 @@ use crate::export::{
 use crate::feeds::run_sweep;
 use crate::models::{
     AiConfig, AiConfigUpdate, AiModelsRequest, AiProviderKind, AiQueryRequest, AiTestRequest,
-    AlertRules, AuthLoginRequest, AuthStatusResponse, BulkIocRequest, BulkIocResponse,
-    CustomFeedConfig, CustomFeedCreateRequest, CveTriage, CveTriageUpdateRequest, DashboardKpis,
-    DashboardPayload, EpssSpike, FeedConfigUpdateRequest, IocHit, IocLookupResult, MyStackConfig,
-    MyStackPayload, MyStackUpdateRequest, ServerModeInfo, Severity, SnapshotImportResult, SseEvent,
+    AlertRules, AuthChangePasswordRequest, AuthLoginRequest, AuthSessionPublic, AuthSetupRequest,
+    AuthStatusResponse, BulkIocRequest, BulkIocResponse, CustomFeedConfig, CustomFeedCreateRequest,
+    CveTriage, CveTriageUpdateRequest, DashboardKpis, DashboardPayload, EpssSpike,
+    FeedConfigUpdateRequest, IocHit, IocLookupResult, MyStackConfig, MyStackPayload,
+    MyStackUpdateRequest, ServerModeInfo, Severity, SnapshotImportResult, SseEvent,
     StackImportRequest, StackImportResponse, StackMatchSummary, ThreatAlert, ThreatNewsItem,
-    TriageStatus, Vulnerability, WebhookCreateRequest, WebhookKind, WebhookTarget,
-    WebhookUpdateRequest,
+    TotpDisableRequest, TotpEnrollResponse, TotpVerifyRequest, TriageStatus, Vulnerability,
+    WebhookCreateRequest, WebhookKind, WebhookTarget, WebhookUpdateRequest,
 };
 use crate::security::{
     constant_time_eq, extract_bearer_token, extract_session_cookie, keychain_delete, keychain_set,
     strip_invisible_unicode, validate_outbound_url, OutboundUrlPolicy, SESSION_COOKIE_NAME,
 };
 use crate::stack::{correlate_stack, parse_stack_manifest};
+use crate::storage::AuthUserRecord;
 use crate::store::{AppState, ThreatStore};
 use crate::webhooks::{
     build_webhook_payload, send_webhook_payload, to_public_webhook, WebhookDispatchItem,
@@ -51,8 +59,18 @@ pub fn api_router(state: AppState) -> Router {
     let standard = Router::new()
         .route("/health", get(health))
         .route("/auth/status", get(auth_status))
+        .route("/auth/setup", post(auth_setup))
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
+        .route("/auth/sessions", get(auth_list_sessions))
+        .route(
+            "/auth/sessions/revoke-all",
+            post(auth_revoke_other_sessions),
+        )
+        .route("/auth/change-password", post(auth_change_password))
+        .route("/auth/totp/enroll", post(auth_totp_enroll))
+        .route("/auth/totp/verify", post(auth_totp_verify))
+        .route("/auth/totp/disable", post(auth_totp_disable))
         .route("/dashboard", get(dashboard))
         .route("/vulnerabilities", get(list_vulnerabilities))
         .route("/vulnerabilities/{id}", get(get_vulnerability))
@@ -125,76 +143,265 @@ fn require_writable(state: &AppState) -> Result<(), Box<Response>> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    pub authenticated: bool,
+    pub user: Option<AuthUserRecord>,
+    pub session_hash: Option<String>,
+}
+
+pub fn is_auth_enforced(state: &AppState) -> bool {
+    !state.server_mode.no_auth_mode || state.server_mode.auth_token.is_some()
+}
+
+pub fn resolve_request_auth(state: &AppState, headers: &HeaderMap) -> ResolvedAuth {
+    // 1. Check ephemeral HttpOnly DB session cookie first (preferred)
+    if let Some(raw_cookie) = extract_session_cookie(headers, SESSION_COOKIE_NAME) {
+        let token_hash = hash_secret_sha256(raw_cookie);
+        if let Some((_sess, user)) = state.db.validate_auth_session(&token_hash) {
+            return ResolvedAuth {
+                authenticated: true,
+                user: Some(user),
+                session_hash: Some(token_hash),
+            };
+        }
+        // Fallback: legacy static AUTH_TOKEN cookie
+        if let Some(expected) = state.server_mode.auth_token.as_deref() {
+            if constant_time_eq(raw_cookie, expected) {
+                return ResolvedAuth {
+                    authenticated: true,
+                    user: None,
+                    session_hash: None,
+                };
+            }
+        }
+    }
+
+    // 2. Check Authorization: Bearer <AUTH_TOKEN>
+    if let Some(expected) = state.server_mode.auth_token.as_deref() {
+        if let Some(bearer) = extract_bearer_token(headers) {
+            if constant_time_eq(bearer, expected) {
+                return ResolvedAuth {
+                    authenticated: true,
+                    user: None,
+                    session_hash: None,
+                };
+            }
+        }
+    }
+
+    // 3. Explicit --no-auth loopback kiosk mode (only when no AUTH_TOKEN is set)
+    if state.server_mode.no_auth_mode && state.server_mode.auth_token.is_none() {
+        return ResolvedAuth {
+            authenticated: true,
+            user: None,
+            session_hash: None,
+        };
+    }
+
+    ResolvedAuth {
+        authenticated: false,
+        user: None,
+        session_hash: None,
+    }
+}
+
 pub fn is_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = state.server_mode.auth_token.as_deref() else {
-        return true;
-    };
-    if let Some(bearer) = extract_bearer_token(headers) {
-        if constant_time_eq(bearer, expected) {
-            return true;
-        }
-    }
-    if let Some(cookie) = extract_session_cookie(headers, SESSION_COOKIE_NAME) {
-        if constant_time_eq(cookie, expected) {
-            return true;
-        }
-    }
-    false
+    resolve_request_auth(state, headers).authenticated
 }
 
-fn build_server_mode_info(state: &AppState, headers: &HeaderMap) -> ServerModeInfo {
-    ServerModeInfo {
-        version: state.server_mode.version.clone(),
-        wallboard_mode: state.server_mode.wallboard_mode,
-        offline_mode: state.server_mode.offline_mode,
-        auth_required: state.server_mode.auth_token.is_some(),
-        authenticated: is_request_authenticated(state, headers),
-        bind_addr: state.server_mode.bind_addr.clone(),
-    }
-}
-
-async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    Json(AuthStatusResponse {
-        auth_required: state.server_mode.auth_token.is_some(),
-        authenticated: is_request_authenticated(&state, &headers),
-        wallboard_mode: state.server_mode.wallboard_mode,
-        offline_mode: state.server_mode.offline_mode,
-    })
-}
-
-async fn auth_login(
-    State(state): State<AppState>,
-    req_headers: HeaderMap,
-    Json(body): Json<AuthLoginRequest>,
-) -> impl IntoResponse {
-    let Some(expected) = state.server_mode.auth_token.as_deref() else {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({ "authenticated": true, "auth_required": false })),
-        )
-            .into_response();
-    };
-
-    if !constant_time_eq(body.token.trim(), expected) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "Invalid access token" })),
-        )
-            .into_response();
-    }
-
+fn build_session_cookie_header(
+    req_headers: &HeaderMap,
+    raw_token: &str,
+    max_age_secs: i64,
+) -> String {
     let is_https = req_headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|p| p.eq_ignore_ascii_case("https"));
     let secure_attr = if is_https { "; Secure" } else { "" };
-    let cookie_val = format!(
-        "{SESSION_COOKIE_NAME}={expected}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200{secure_attr}"
-    );
+    format!(
+        "{SESSION_COOKIE_NAME}={raw_token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}{secure_attr}"
+    )
+}
 
+fn extract_sanitized_user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            strip_invisible_unicode(s)
+                .trim()
+                .chars()
+                .take(120)
+                .collect()
+        })
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(|| "Unknown Browser".to_string())
+}
+
+fn extract_rate_limit_client(headers: &HeaderMap) -> String {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("ua");
+    let fwd = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .unwrap_or("local");
+    let digest = hash_secret_sha256(&format!("{fwd}|{ua}"));
+    digest[..16].to_string()
+}
+
+fn build_auth_status_payload(state: &AppState, headers: &HeaderMap) -> AuthStatusResponse {
+    let has_user = state.db.has_any_auth_user();
+    let enforced = is_auth_enforced(state);
+    let resolved = resolve_request_auth(state, headers);
+    let setup_required = enforced && !has_user && state.server_mode.auth_token.is_none();
+    AuthStatusResponse {
+        auth_required: enforced,
+        setup_required,
+        authenticated: resolved.authenticated,
+        username: resolved.user.as_ref().map(|u| u.username.clone()),
+        display_name: resolved.user.as_ref().map(|u| u.display_name.clone()),
+        totp_enabled: resolved.user.as_ref().is_some_and(|u| u.totp_enabled),
+        recovery_codes_remaining: resolved
+            .user
+            .as_ref()
+            .map(|u| u.recovery_hashes.len())
+            .unwrap_or(0),
+        token_auth_enabled: state.server_mode.auth_token.is_some(),
+        wallboard_mode: state.server_mode.wallboard_mode,
+        offline_mode: state.server_mode.offline_mode,
+        no_auth_mode: state.server_mode.no_auth_mode,
+    }
+}
+
+fn build_server_mode_info(state: &AppState, headers: &HeaderMap) -> ServerModeInfo {
+    let status = build_auth_status_payload(state, headers);
+    ServerModeInfo {
+        version: state.server_mode.version.clone(),
+        wallboard_mode: state.server_mode.wallboard_mode,
+        offline_mode: state.server_mode.offline_mode,
+        no_auth_mode: state.server_mode.no_auth_mode,
+        auth_required: status.auth_required,
+        setup_required: status.setup_required,
+        authenticated: status.authenticated,
+        username: status.username,
+        totp_enabled: status.totp_enabled,
+        bind_addr: state.server_mode.bind_addr.clone(),
+    }
+}
+
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    Json(build_auth_status_payload(&state, &headers))
+}
+
+async fn auth_setup(
+    State(state): State<AppState>,
+    req_headers: HeaderMap,
+    Json(body): Json<AuthSetupRequest>,
+) -> impl IntoResponse {
+    if state.db.has_any_auth_user() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "An administrator account already exists. Please sign in instead."
+            })),
+        )
+            .into_response();
+    }
+
+    let username = match validate_username(&body.username) {
+        Ok(u) => u,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = validate_password(&body.password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+    let display_name = {
+        let cleaned = strip_invisible_unicode(&body.display_name)
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            username.clone()
+        } else {
+            cleaned.chars().take(48).collect()
+        }
+    };
+
+    let pw_clone = body.password.clone();
+    let password_hash = match tokio::task::spawn_blocking(move || hash_password(&pw_clone)).await {
+        Ok(Ok(h)) => h,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed hashing password" })),
+            )
+                .into_response();
+        }
+    };
+
+    let user = match state
+        .db
+        .create_initial_admin_user(&username, &display_name, &password_hash)
+    {
+        Ok(u) => u,
+        Err(msg) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+
+    let raw_token = match generate_session_token() {
+        Ok(t) => t,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let token_hash = hash_secret_sha256(&raw_token);
+    let ua = extract_sanitized_user_agent(&req_headers);
+    let ttl = 43_200; // 12h
+    if let Err(msg) = state
+        .db
+        .create_auth_session(&token_hash, user.id, &user.username, &ua, ttl)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    let cookie_val = build_session_cookie_header(&req_headers, &raw_token, ttl);
     let mut resp = (
         StatusCode::OK,
-        Json(serde_json::json!({ "authenticated": true, "auth_required": true })),
+        Json(serde_json::json!({
+            "authenticated": true,
+            "setup_required": false,
+            "username": user.username,
+            "display_name": user.display_name,
+            "totp_enabled": false,
+        })),
     )
         .into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie_val) {
@@ -203,7 +410,238 @@ async fn auth_login(
     resp
 }
 
-async fn auth_logout() -> impl IntoResponse {
+async fn auth_login(
+    State(state): State<AppState>,
+    req_headers: HeaderMap,
+    Json(body): Json<AuthLoginRequest>,
+) -> impl IntoResponse {
+    let client_id = extract_rate_limit_client(&req_headers);
+
+    // Path A: Legacy/automation AUTH_TOKEN login (only when token field is supplied and AUTH_TOKEN is configured)
+    let raw_static_token = body.token.trim();
+    if !raw_static_token.is_empty() && body.username.trim().is_empty() {
+        let rate_key = format!("{client_id}:__token__");
+        if let Err(retry_after) = state.auth_limiter.check_locked(&rate_key) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                Json(serde_json::json!({
+                    "error": format!("Too many failed login attempts. Try again in {retry_after}s."),
+                    "retry_after_secs": retry_after
+                })),
+            )
+                .into_response();
+        }
+
+        let Some(expected) = state.server_mode.auth_token.as_deref() else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Access token authentication is not enabled on this server." })),
+            )
+                .into_response();
+        };
+
+        if !constant_time_eq(raw_static_token, expected) {
+            let lock = state.auth_limiter.record_failure(&rate_key);
+            if let Some(retry_after) = lock {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": format!("Too many failed login attempts. Locked for {retry_after}s."),
+                        "retry_after_secs": retry_after
+                    })),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Invalid access token" })),
+            )
+                .into_response();
+        }
+
+        state.auth_limiter.record_success(&rate_key);
+        let cookie_val = build_session_cookie_header(&req_headers, expected, 43_200);
+        let mut resp = (
+            StatusCode::OK,
+            Json(serde_json::json!({ "authenticated": true, "auth_required": true })),
+        )
+            .into_response();
+        if let Ok(hv) = HeaderValue::from_str(&cookie_val) {
+            resp.headers_mut().insert(header::SET_COOKIE, hv);
+        }
+        return resp;
+    }
+
+    // Path B: Local Username + Argon2id Password + Optional TOTP 2FA login
+    let norm_user = body.username.trim().to_ascii_lowercase();
+    let rate_key = format!("{client_id}:{norm_user}");
+    if let Err(retry_after) = state.auth_limiter.check_locked(&rate_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after.to_string())],
+            Json(serde_json::json!({
+                "error": format!("Too many failed login attempts. Try again in {retry_after}s."),
+                "retry_after_secs": retry_after
+            })),
+        )
+            .into_response();
+    }
+
+    if !state.db.has_any_auth_user() {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(serde_json::json!({
+                "error": "No administrator account exists yet. Complete first-run setup.",
+                "setup_required": true
+            })),
+        )
+            .into_response();
+    }
+
+    let user_opt = state.db.get_auth_user_by_username(&norm_user);
+    let pw_input = body.password.clone();
+    let (user_opt, pw_valid) = match user_opt {
+        Some(u) => {
+            let stored = u.password_hash.clone();
+            let ok = tokio::task::spawn_blocking(move || verify_password(&pw_input, &stored))
+                .await
+                .unwrap_or(false);
+            (Some(u), ok)
+        }
+        None => {
+            let _ = tokio::task::spawn_blocking(move || dummy_verify_password(&pw_input)).await;
+            (None, false)
+        }
+    };
+
+    let Some(user) = user_opt.filter(|_| pw_valid) else {
+        let lock = state.auth_limiter.record_failure(&rate_key);
+        if let Some(retry_after) = lock {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                Json(serde_json::json!({
+                    "error": format!("Too many failed login attempts. Locked for {retry_after}s."),
+                    "retry_after_secs": retry_after
+                })),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid username or password." })),
+        )
+            .into_response();
+    };
+
+    // Enforce TOTP 2FA if enabled on this user
+    if user.totp_enabled {
+        let supplied = body.totp_code.trim();
+        if supplied.is_empty() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "authenticated": false,
+                    "requires_totp": true,
+                    "username": user.username,
+                })),
+            )
+                .into_response();
+        }
+
+        let mut verified_2fa = false;
+        if let Some(secret) = user.totp_secret_b32.as_deref() {
+            if let Some(step) = verify_totp_code(secret, supplied, user.totp_last_step) {
+                let _ = state.db.update_user_totp_step(user.id, step);
+                verified_2fa = true;
+            }
+        }
+        if !verified_2fa {
+            if let Some(remaining) =
+                consume_recovery_code(&user.username, supplied, &user.recovery_hashes)
+            {
+                let _ = state.db.update_user_recovery_hashes(user.id, &remaining);
+                verified_2fa = true;
+            }
+        }
+
+        if !verified_2fa {
+            let lock = state.auth_limiter.record_failure(&rate_key);
+            if let Some(retry_after) = lock {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": format!("Too many failed 2FA attempts. Locked for {retry_after}s."),
+                        "retry_after_secs": retry_after,
+                        "requires_totp": true
+                    })),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Invalid 2FA authenticator or recovery code.",
+                    "requires_totp": true
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    state.auth_limiter.record_success(&rate_key);
+    state.db.touch_user_last_login(user.id);
+
+    let raw_token = match generate_session_token() {
+        Ok(t) => t,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let token_hash = hash_secret_sha256(&raw_token);
+    let ua = extract_sanitized_user_agent(&req_headers);
+    let ttl = if body.remember_me { 86_400 } else { 43_200 };
+    if let Err(msg) = state
+        .db
+        .create_auth_session(&token_hash, user.id, &user.username, &ua, ttl)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    let cookie_val = build_session_cookie_header(&req_headers, &raw_token, ttl);
+    let mut resp = (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "authenticated": true,
+            "auth_required": true,
+            "username": user.username,
+            "display_name": user.display_name,
+            "totp_enabled": user.totp_enabled,
+        })),
+    )
+        .into_response();
+    if let Ok(hv) = HeaderValue::from_str(&cookie_val) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+async fn auth_logout(State(state): State<AppState>, req_headers: HeaderMap) -> impl IntoResponse {
+    if let Some(raw_cookie) = extract_session_cookie(&req_headers, SESSION_COOKIE_NAME) {
+        let token_hash = hash_secret_sha256(raw_cookie);
+        state.db.delete_auth_session(&token_hash);
+    }
     let mut resp = (
         StatusCode::OK,
         Json(serde_json::json!({ "authenticated": false })),
@@ -214,6 +652,288 @@ async fn auth_logout() -> impl IntoResponse {
         HeaderValue::from_static("abw_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
     );
     resp
+}
+
+async fn auth_list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return Json(Vec::<AuthSessionPublic>::new()).into_response();
+    };
+    let current_hash = resolved.session_hash.as_deref();
+    let sessions: Vec<AuthSessionPublic> = state
+        .db
+        .list_user_sessions(user.id)
+        .into_iter()
+        .map(|s| AuthSessionPublic {
+            id_preview: s.token_hash.chars().take(10).collect(),
+            username: s.username,
+            user_agent: s.user_agent,
+            created_at: s.created_at,
+            last_seen_at: s.last_seen_at,
+            expires_at: s.expires_at,
+            is_current: current_hash.is_some_and(|ch| constant_time_eq(ch, &s.token_hash)),
+        })
+        .collect();
+    Json(sessions).into_response()
+}
+
+async fn auth_revoke_other_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "User session required." })),
+        )
+            .into_response();
+    };
+    match state
+        .db
+        .revoke_other_auth_sessions(user.id, resolved.session_hash.as_deref())
+    {
+        Ok(revoked) => Json(serde_json::json!({ "revoked": revoked })).into_response(),
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn auth_change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AuthChangePasswordRequest>,
+) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Local user session required to change password." })),
+        )
+            .into_response();
+    };
+    if let Err(msg) = validate_password(&body.new_password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    let cur_pw = body.current_password.clone();
+    let stored_hash = user.password_hash.clone();
+    let cur_ok = tokio::task::spawn_blocking(move || verify_password(&cur_pw, &stored_hash))
+        .await
+        .unwrap_or(false);
+    if !cur_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Current password is incorrect." })),
+        )
+            .into_response();
+    }
+
+    let new_pw = body.new_password.clone();
+    let new_hash = match tokio::task::spawn_blocking(move || hash_password(&new_pw)).await {
+        Ok(Ok(h)) => h,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed hashing new password." })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(msg) = state.db.update_auth_user_password(user.id, &new_hash) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+    let revoked = state
+        .db
+        .revoke_other_auth_sessions(user.id, resolved.session_hash.as_deref())
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "updated": true,
+        "other_sessions_revoked": revoked
+    }))
+    .into_response()
+}
+
+async fn auth_totp_enroll(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Local user session required to configure 2FA." })),
+        )
+            .into_response();
+    };
+    if user.totp_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "TOTP 2FA is already enabled. Disable it first to rotate secret." })),
+        )
+            .into_response();
+    }
+
+    let secret_b32 = match generate_totp_secret() {
+        Ok(s) => s,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = state.db.set_pending_totp_secret(user.id, &secret_b32) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    let otpauth_uri = build_otpauth_uri(&user.username, &secret_b32);
+    let qr_svg_data_uri = match render_qr_svg_data_uri(&otpauth_uri) {
+        Ok(q) => q,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(TotpEnrollResponse {
+        secret_b32,
+        otpauth_uri,
+        qr_svg_data_uri,
+    })
+    .into_response()
+}
+
+async fn auth_totp_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TotpVerifyRequest>,
+) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Local user session required." })),
+        )
+            .into_response();
+    };
+    let Some(secret_b32) = user.totp_secret_b32.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Start 2FA enrollment first." })),
+        )
+            .into_response();
+    };
+    let Some(step) = verify_totp_code(secret_b32, &body.code, user.totp_last_step) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid 6-digit authenticator code. Check device clock and try again." })),
+        )
+            .into_response();
+    };
+
+    let (recovery_codes, recovery_hashes) = match generate_recovery_codes(&user.username) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    if let Err(msg) = state
+        .db
+        .enable_totp_for_user(user.id, &recovery_hashes, step)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "totp_enabled": true,
+        "recovery_codes": recovery_codes
+    }))
+    .into_response()
+}
+
+async fn auth_totp_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TotpDisableRequest>,
+) -> impl IntoResponse {
+    let resolved = resolve_request_auth(&state, &headers);
+    let Some(user) = resolved.user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Local user session required." })),
+        )
+            .into_response();
+    };
+
+    let pw = body.password.clone();
+    let stored_hash = user.password_hash.clone();
+    let pw_ok = tokio::task::spawn_blocking(move || verify_password(&pw, &stored_hash))
+        .await
+        .unwrap_or(false);
+    if !pw_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Password is incorrect." })),
+        )
+            .into_response();
+    }
+
+    if user.totp_enabled {
+        let supplied = body.code.trim();
+        let valid_totp = user
+            .totp_secret_b32
+            .as_deref()
+            .and_then(|s| verify_totp_code(s, supplied, user.totp_last_step))
+            .is_some();
+        let valid_recovery =
+            consume_recovery_code(&user.username, supplied, &user.recovery_hashes).is_some();
+        if !valid_totp && !valid_recovery {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Provide a valid 6-digit 2FA or recovery code to disable 2FA." })),
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(msg) = state.db.disable_totp_for_user(user.id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "totp_enabled": false })).into_response()
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -235,7 +955,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "feeds_total": store.feed_health.len(),
         "wallboard_mode": state.server_mode.wallboard_mode,
         "offline_mode": state.server_mode.offline_mode,
-        "auth_required": state.server_mode.auth_token.is_some(),
+        "auth_required": is_auth_enforced(&state),
+        "setup_required": is_auth_enforced(&state) && !state.db.has_any_auth_user() && state.server_mode.auth_token.is_none(),
     }))
 }
 

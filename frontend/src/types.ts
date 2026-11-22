@@ -457,16 +457,62 @@ export interface ServerModeInfo {
   version: string;
   wallboard_mode: boolean;
   offline_mode: boolean;
+  no_auth_mode: boolean;
   auth_required: boolean;
+  setup_required: boolean;
   authenticated: boolean;
+  username: string | null;
+  totp_enabled: boolean;
   bind_addr: string;
 }
 
 export interface AuthStatusResponse {
   auth_required: boolean;
+  setup_required: boolean;
   authenticated: boolean;
+  username: string | null;
+  display_name: string | null;
+  totp_enabled: boolean;
+  recovery_codes_remaining: number;
+  token_auth_enabled: boolean;
   wallboard_mode: boolean;
   offline_mode: boolean;
+  no_auth_mode: boolean;
+}
+
+export interface AuthLoginPayload {
+  username?: string;
+  password?: string;
+  totp_code?: string;
+  remember_me?: boolean;
+  token?: string;
+}
+
+export interface AuthLoginResponse {
+  authenticated: boolean;
+  requires_totp?: boolean;
+  setup_required?: boolean;
+  username?: string;
+  display_name?: string;
+  totp_enabled?: boolean;
+  retry_after_secs?: number;
+  error?: string;
+}
+
+export interface TotpEnrollResponse {
+  secret_b32: string;
+  otpauth_uri: string;
+  qr_svg_data_uri: string;
+}
+
+export interface AuthSessionPublic {
+  id_preview: string;
+  username: string;
+  user_agent: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  is_current: boolean;
 }
 
 export interface DashboardPayload {

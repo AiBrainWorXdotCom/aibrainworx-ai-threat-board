@@ -55,7 +55,9 @@ Once built (or downloaded from **GitHub Releases**), `aibrainworx-threat-board` 
 # Optional flags:
 #   --wallboard         Read-only kiosk display mode (403 on mutations)
 #   --offline           Air-gapped mode (disables outbound feed sweeps; use Snapshot Import)
-#   --bind <IP>         Bind interface (non-loopback auto-enables AUTH_TOKEN)
+#   --no-auth           Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)
+#   --reset-auth        Clear local admin password & 2FA secrets to return to first-run setup
+#   --bind <IP>         Bind interface (non-loopback enforces authentication)
 #   --port <PORT>       Listen port (default 8080)
 #   --data-dir <PATH>   Custom SQLite database directory (default ./data)
 ```

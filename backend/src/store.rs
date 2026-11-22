@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 
+use crate::auth::AuthRateLimiter;
 use crate::models::{
     AiConfig, AiThreatBrief, AlertRules, CveTriage, FeedHealth, FeedSettings, MyStackConfig,
     NetworkTelemetry, SseEvent, SweepDelta, ThreatAlert, ThreatNewsItem, Vulnerability,
@@ -22,6 +23,7 @@ pub struct ServerModeConfig {
     pub version: String,
     pub wallboard_mode: bool,
     pub offline_mode: bool,
+    pub no_auth_mode: bool,
     pub auth_token: Option<String>,
     pub bind_addr: String,
 }
@@ -204,6 +206,7 @@ impl ThreatStore {
 pub struct AppState {
     pub store: Arc<RwLock<ThreatStore>>,
     pub db: Arc<SqliteStorage>,
+    pub auth_limiter: Arc<AuthRateLimiter>,
     pub sweep_in_progress: Arc<AtomicBool>,
     pub sse_tx: broadcast::Sender<SseEvent>,
     pub http: reqwest::Client,

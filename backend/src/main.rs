@@ -1,5 +1,6 @@
 mod ai_providers;
 mod analyzer;
+mod auth;
 mod export;
 mod feeds;
 mod models;
@@ -29,9 +30,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
 use crate::analyzer::{compute_kev_days_remaining, generate_ai_brief};
+use crate::auth::AuthRateLimiter;
 use crate::feeds::run_sweep;
 use crate::models::SseEvent;
-use crate::routes::{api_router, is_request_authenticated};
+use crate::routes::{api_router, is_auth_enforced, is_request_authenticated};
 use crate::security::generate_random_token;
 use crate::stack::correlate_stack;
 use crate::storage::SqliteStorage;
@@ -54,6 +56,8 @@ struct SecurityConfig {
 struct CliOptions {
     wallboard: bool,
     offline: bool,
+    no_auth: bool,
+    reset_auth: bool,
     bind: String,
     port: u16,
     data_dir: Option<PathBuf>,
@@ -62,6 +66,8 @@ struct CliOptions {
 fn parse_cli_and_env() -> CliOptions {
     let mut wallboard = std::env::var("WALLBOARD_MODE").as_deref() == Ok("1");
     let mut offline = std::env::var("OFFLINE_MODE").as_deref() == Ok("1");
+    let mut no_auth = std::env::var("NO_AUTH").as_deref() == Ok("1");
+    let mut reset_auth = false;
     let mut bind = std::env::var("BIND_ADDR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -81,6 +87,8 @@ fn parse_cli_and_env() -> CliOptions {
         match args[i].as_str() {
             "--wallboard" => wallboard = true,
             "--offline" => offline = true,
+            "--no-auth" => no_auth = true,
+            "--reset-auth" => reset_auth = true,
             "--bind" => {
                 if let Some(val) = args.get(i + 1) {
                     bind = val.trim().to_string();
@@ -103,7 +111,7 @@ fn parse_cli_and_env() -> CliOptions {
             }
             "-h" | "--help" => {
                 println!(
-                    "AiBrainWorX Threat Board v{}\nUsage: aibrainworx-threat-board [OPTIONS]\n  --wallboard         Read-only kiosk display mode\n  --offline           Air-gapped mode (disable outbound threat feed sweeps)\n  --bind <IP>         Bind IP address (default: 127.0.0.1; non-loopback enables AUTH_TOKEN)\n  --port <PORT>       Listen port (default: 8080)\n  --data-dir <DIR>    Override SQLite data directory (default: ./data)",
+                    "AiBrainWorX Threat Board v{}\nUsage: aibrainworx-threat-board [OPTIONS]\n  --wallboard         Read-only kiosk display mode\n  --offline           Air-gapped mode (disable outbound threat feed sweeps)\n  --no-auth           Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)\n  --reset-auth        Clear local admin password & 2FA to return to first-run setup\n  --bind <IP>         Bind IP address (default: 127.0.0.1; non-loopback enforces auth)\n  --port <PORT>       Listen port (default: 8080)\n  --data-dir <DIR>    Override SQLite data directory (default: ./data)",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -116,6 +124,8 @@ fn parse_cli_and_env() -> CliOptions {
     CliOptions {
         wallboard,
         offline,
+        no_auth,
+        reset_auth,
         bind,
         port,
         data_dir,
@@ -209,7 +219,11 @@ fn apply_security_headers(resp: &mut Response, no_store: bool) {
 fn is_auth_exempt_api_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/health" | "/api/auth/status" | "/api/auth/login" | "/api/auth/logout"
+        "/api/health"
+            | "/api/auth/status"
+            | "/api/auth/setup"
+            | "/api/auth/login"
+            | "/api/auth/logout"
     )
 }
 
@@ -294,7 +308,7 @@ async fn security_middleware(
             }
         }
 
-        if sec.state.server_mode.auth_token.is_some()
+        if is_auth_enforced(&sec.state)
             && !is_auth_exempt_api_path(&path)
             && !is_request_authenticated(&sec.state, req.headers())
         {
@@ -306,8 +320,10 @@ async fn security_middleware(
     }
 
     let mut resp = next.run(req).await;
-    let is_sensitive_no_store =
-        path == "/api/ai/config" || path == "/api/webhooks" || path == "/api/snapshot/export";
+    let is_sensitive_no_store = path.starts_with("/api/auth/")
+        || path == "/api/ai/config"
+        || path == "/api/webhooks"
+        || path == "/api/snapshot/export";
     apply_security_headers(&mut resp, is_sensitive_no_store);
     resp
 }
@@ -451,6 +467,14 @@ async fn main() {
     let db = Arc::new(
         SqliteStorage::open(db_path.clone()).expect("Failed initializing embedded SQLite storage"),
     );
+    if cli.reset_auth {
+        db.reset_all_auth()
+            .expect("Failed resetting local authentication state");
+        info!("================================================================");
+        info!("--reset-auth: Cleared local admin account, 2FA secrets, and sessions.");
+        info!("Open the dashboard in your browser to run First-Run Admin Setup.");
+        info!("================================================================");
+    }
     if let Err(e) = db.migrate_legacy_json_if_needed(&legacy_json_path) {
         tracing::warn!("Legacy JSON migration warning: {e}");
     }
@@ -473,6 +497,15 @@ async fn main() {
     }
 
     let bind_is_loopback = is_loopback_bind(&cli.bind);
+    let no_auth_mode = if cli.no_auth && !bind_is_loopback {
+        tracing::warn!(
+            "--no-auth is restricted to loopback (127.0.0.1 / ::1) and was IGNORED for non-loopback bind {}",
+            cli.bind
+        );
+        false
+    } else {
+        cli.no_auth
+    };
     let explicit_token = std::env::var("AUTH_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())
@@ -480,14 +513,14 @@ async fn main() {
 
     let auth_token = if explicit_token.is_some() {
         explicit_token
-    } else if !bind_is_loopback {
+    } else if !bind_is_loopback && !db.has_any_auth_user() {
         let generated = generate_random_token(24).expect("Failed generating CSPRNG access token");
         info!("================================================================");
         info!(
-            "NON-LOOPBACK BIND DETECTED ({}) WITHOUT AUTH_TOKEN",
+            "NON-LOOPBACK BIND DETECTED ({}) WITHOUT LOCAL ADMIN OR AUTH_TOKEN",
             cli.bind
         );
-        info!("Generated one-time session access token (use Bearer header or UI prompt):");
+        info!("Generated fallback session access token (use Bearer header or UI prompt):");
         info!("AUTH_TOKEN={}", generated);
         info!("================================================================");
         Some(generated)
@@ -518,6 +551,7 @@ async fn main() {
     let state = AppState {
         store: Arc::new(RwLock::new(initial_store)),
         db,
+        auth_limiter: Arc::new(AuthRateLimiter::new()),
         sweep_in_progress: Arc::new(AtomicBool::new(false)),
         sse_tx: sse_tx.clone(),
         http,
@@ -526,6 +560,7 @@ async fn main() {
             version: env!("CARGO_PKG_VERSION").to_string(),
             wallboard_mode: cli.wallboard,
             offline_mode: cli.offline,
+            no_auth_mode,
             auth_token: auth_token.clone(),
             bind_addr: cli.bind.clone(),
         },
@@ -614,10 +649,11 @@ async fn main() {
     info!("SQLite Store  : {}", db_path.display());
     info!("Frontend      : {}", frontend_label);
     info!(
-        "Modes         : wallboard={} | offline={} | auth={}",
+        "Modes         : wallboard={} | offline={} | auth={} | no_auth={}",
         cli.wallboard,
         cli.offline,
-        auth_token.is_some()
+        !no_auth_mode || auth_token.is_some(),
+        no_auth_mode
     );
     info!("================================================================");
 
@@ -656,20 +692,30 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state(wallboard_mode: bool, auth_token: Option<String>) -> (AppState, PathBuf) {
+        test_state_with_auth(wallboard_mode, auth_token.is_none(), auth_token)
+    }
+
+    fn test_state_with_auth(
+        wallboard_mode: bool,
+        no_auth_mode: bool,
+        auth_token: Option<String>,
+    ) -> (AppState, PathBuf) {
         let db_path = std::env::temp_dir().join(format!("abw_http_{}.db", uuid::Uuid::new_v4()));
         let db = Arc::new(SqliteStorage::open(db_path.clone()).unwrap());
         let (sse_tx, _) = broadcast::channel::<SseEvent>(16);
         let state = AppState {
             store: Arc::new(RwLock::new(ThreatStore::default())),
             db,
+            auth_limiter: Arc::new(AuthRateLimiter::new()),
             sweep_in_progress: Arc::new(AtomicBool::new(false)),
             sse_tx,
             http: reqwest::Client::new(),
             ai_http: reqwest::Client::new(),
             server_mode: ServerModeConfig {
-                version: "0.2.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 wallboard_mode,
                 offline_mode: true,
+                no_auth_mode,
                 auth_token,
                 bind_addr: "127.0.0.1".to_string(),
             },
@@ -787,5 +833,204 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn full_local_auth_setup_sessions_lockout_and_totp_flow() {
+        use http_body_util::BodyExt;
+
+        let (state, db_path) = test_state_with_auth(false, false, None);
+        let app = build_app(
+            state,
+            vec!["http://127.0.0.1:8080".into()],
+            false,
+            "127.0.0.1".into(),
+            None,
+        );
+
+        // 1. Default mode blocks /api/dashboard until setup + login
+        let unauth_dash = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .header(header::HOST, "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauth_dash).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 2. First-run setup creates Argon2id admin & issues random HttpOnly session cookie
+        let setup_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/setup")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"socadmin","display_name":"SOC Admin","password":"UltraStrongPassword!99"}"#,
+            ))
+            .unwrap();
+        let setup_resp = app.clone().oneshot(setup_req).await.unwrap();
+        assert_eq!(setup_resp.status(), StatusCode::OK);
+        let cookie_hdr = setup_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie_hdr.contains("HttpOnly"));
+        assert!(cookie_hdr.contains("SameSite=Strict"));
+        let session_cookie = cookie_hdr.split(';').next().unwrap().to_string();
+
+        // 3. Second setup attempt is rejected with 403
+        let setup_again = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/setup")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"attacker","password":"AnotherPassword!99"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(setup_again).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 4. Session cookie accesses protected /api/dashboard
+        let authed_dash = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::COOKIE, &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(authed_dash).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // 5. TOTP enrollment + verification generates offline SVG QR and 8 recovery codes
+        let enroll_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/totp/enroll")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::COOKIE, &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let enroll_resp = app.clone().oneshot(enroll_req).await.unwrap();
+        assert_eq!(enroll_resp.status(), StatusCode::OK);
+        let enroll_bytes = enroll_resp.into_body().collect().await.unwrap().to_bytes();
+        let enroll_json: serde_json::Value = serde_json::from_slice(&enroll_bytes).unwrap();
+        let secret_b32 = enroll_json["secret_b32"].as_str().unwrap().to_string();
+        assert!(enroll_json["qr_svg_data_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/svg+xml;base64,"));
+
+        let now_step = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 30;
+        let totp_code = crate::auth::totp_code_at_step(&secret_b32, now_step).unwrap();
+
+        let verify_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/totp/verify")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::COOKIE, &session_cookie)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"code":"{totp_code}"}}"#)))
+            .unwrap();
+        let verify_resp = app.clone().oneshot(verify_req).await.unwrap();
+        assert_eq!(verify_resp.status(), StatusCode::OK);
+        let verify_bytes = verify_resp.into_body().collect().await.unwrap().to_bytes();
+        let verify_json: serde_json::Value = serde_json::from_slice(&verify_bytes).unwrap();
+        let recovery_code = verify_json["recovery_codes"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(verify_json["recovery_codes"].as_array().unwrap().len(), 8);
+
+        // 6. Logout immediately revokes session cookie in SQLite
+        let logout_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/logout")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::COOKIE, &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(logout_req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let revoked_dash = axum::http::Request::builder()
+            .uri("/api/dashboard")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::COOKIE, &session_cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(revoked_dash).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 7. Login without TOTP returns requires_totp=true challenge
+        let step1_req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"socadmin","password":"UltraStrongPassword!99"}"#,
+            ))
+            .unwrap();
+        let step1_resp = app.clone().oneshot(step1_req).await.unwrap();
+        assert_eq!(step1_resp.status(), StatusCode::OK);
+        let step1_json: serde_json::Value =
+            serde_json::from_slice(&step1_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(step1_json["requires_totp"], true);
+        assert_eq!(step1_json["authenticated"], false);
+
+        // 8. Login with one-time recovery code succeeds once and fails on reuse
+        let rec_login = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"username":"socadmin","password":"UltraStrongPassword!99","totp_code":"{recovery_code}"}}"#
+            )))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(rec_login).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // 9. Five failed logins trigger 429 brute-force lockout
+        for attempt in 1..=5 {
+            let bad = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/login")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"socadmin","password":"WrongPassword!00"}"#,
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(bad).await.unwrap();
+            if attempt < 5 {
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert!(resp.headers().contains_key(header::RETRY_AFTER));
+            }
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 }

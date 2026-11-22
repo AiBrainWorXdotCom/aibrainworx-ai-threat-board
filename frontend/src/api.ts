@@ -6,6 +6,9 @@ import type {
   AiQueryResponse,
   AiTestResponse,
   AlertRules,
+  AuthLoginPayload,
+  AuthLoginResponse,
+  AuthSessionPublic,
   AuthStatusResponse,
   BulkIocResponse,
   CustomFeedConfig,
@@ -22,6 +25,7 @@ import type {
   StackImportResponse,
   ThreatAlert,
   ThreatNewsItem,
+  TotpEnrollResponse,
   TriageStatus,
   Vulnerability,
   WebhookCreateRequest,
@@ -34,6 +38,26 @@ import { downloadTextFile } from './utils/opsec';
 
 export const IS_DEMO_MODE = import.meta.env.VITE_DEMO_MODE === '1';
 
+export class ApiError extends Error {
+  status: number;
+  retryAfterSecs?: number;
+  requiresTotp?: boolean;
+  setupRequired?: boolean;
+
+  constructor(
+    message: string,
+    status: number,
+    extra?: { retryAfterSecs?: number; requiresTotp?: boolean; setupRequired?: boolean }
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.retryAfterSecs = extra?.retryAfterSecs;
+    this.requiresTotp = extra?.requiresTotp;
+    this.setupRequired = extra?.setupRequired;
+  }
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     credentials: 'same-origin',
@@ -45,7 +69,30 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`API ${res.status}: ${txt || res.statusText}`);
+    let message = `API ${res.status}: ${txt || res.statusText}`;
+    let retryAfterSecs: number | undefined;
+    let requiresTotp: boolean | undefined;
+    let setupRequired: boolean | undefined;
+    try {
+      const parsed = JSON.parse(txt) as {
+        error?: string;
+        retry_after_secs?: number;
+        requires_totp?: boolean;
+        setup_required?: boolean;
+      };
+      if (parsed.error) message = parsed.error;
+      if (typeof parsed.retry_after_secs === 'number') retryAfterSecs = parsed.retry_after_secs;
+      if (typeof parsed.requires_totp === 'boolean') requiresTotp = parsed.requires_totp;
+      if (typeof parsed.setup_required === 'boolean') setupRequired = parsed.setup_required;
+    } catch {
+      // plain text fallback
+    }
+    const hdrRetry = res.headers.get('retry-after');
+    if (retryAfterSecs === undefined && hdrRetry) {
+      const n = Number(hdrRetry);
+      if (Number.isFinite(n) && n > 0) retryAfterSecs = n;
+    }
+    throw new ApiError(message, res.status, { retryAfterSecs, requiresTotp, setupRequired });
   }
   return res.json() as Promise<T>;
 }
@@ -67,11 +114,23 @@ export const api = {
   getAuthStatus: async (): Promise<AuthStatusResponse> =>
     IS_DEMO_MODE ? demoApi.getAuthStatus() : fetchJson<AuthStatusResponse>('/api/auth/status'),
 
-  login: async (token: string): Promise<{ authenticated: boolean }> => {
+  setupAdmin: async (payload: {
+    username: string;
+    display_name?: string;
+    password: string;
+  }): Promise<AuthLoginResponse> => {
     if (IS_DEMO_MODE) return { authenticated: true };
-    return fetchJson<{ authenticated: boolean }>('/api/auth/login', {
+    return fetchJson<AuthLoginResponse>('/api/auth/setup', {
       method: 'POST',
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(payload),
+    });
+  },
+
+  login: async (payload: AuthLoginPayload): Promise<AuthLoginResponse> => {
+    if (IS_DEMO_MODE) return { authenticated: true };
+    return fetchJson<AuthLoginResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     });
   },
 
@@ -79,6 +138,45 @@ export const api = {
     if (IS_DEMO_MODE) return { authenticated: false };
     return fetchJson<{ authenticated: boolean }>('/api/auth/logout', { method: 'POST' });
   },
+
+  listSessions: async (): Promise<AuthSessionPublic[]> =>
+    IS_DEMO_MODE ? [] : fetchJson<AuthSessionPublic[]>('/api/auth/sessions'),
+
+  revokeOtherSessions: async (): Promise<{ revoked: number }> =>
+    IS_DEMO_MODE
+      ? { revoked: 0 }
+      : fetchJson<{ revoked: number }>('/api/auth/sessions/revoke-all', { method: 'POST' }),
+
+  changePassword: async (
+    current_password: string,
+    new_password: string
+  ): Promise<{ updated: boolean; other_sessions_revoked: number }> =>
+    IS_DEMO_MODE
+      ? { updated: true, other_sessions_revoked: 0 }
+      : fetchJson<{ updated: boolean; other_sessions_revoked: number }>('/api/auth/change-password', {
+          method: 'POST',
+          body: JSON.stringify({ current_password, new_password }),
+        }),
+
+  enrollTotp: async (): Promise<TotpEnrollResponse> =>
+    fetchJson<TotpEnrollResponse>('/api/auth/totp/enroll', { method: 'POST' }),
+
+  verifyTotp: async (
+    code: string
+  ): Promise<{ totp_enabled: boolean; recovery_codes: string[] }> =>
+    fetchJson<{ totp_enabled: boolean; recovery_codes: string[] }>('/api/auth/totp/verify', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+
+  disableTotp: async (
+    password: string,
+    code: string
+  ): Promise<{ totp_enabled: boolean }> =>
+    fetchJson<{ totp_enabled: boolean }>('/api/auth/totp/disable', {
+      method: 'POST',
+      body: JSON.stringify({ password, code }),
+    }),
 
   getDashboard: async (): Promise<DashboardPayload> =>
     IS_DEMO_MODE ? demoApi.getDashboard() : fetchJson<DashboardPayload>('/api/dashboard'),

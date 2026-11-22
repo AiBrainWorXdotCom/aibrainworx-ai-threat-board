@@ -126,7 +126,33 @@ impl SqliteStorage {
                 new_stack_hits_json TEXT NOT NULL,
                 new_alerts_count INTEGER NOT NULL,
                 reviewed INTEGER NOT NULL DEFAULT 0
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                totp_secret_b32 TEXT,
+                totp_enabled INTEGER NOT NULL DEFAULT 0,
+                totp_last_step INTEGER,
+                recovery_hashes_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
+                username TEXT NOT NULL,
+                user_agent TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_exp ON auth_sessions(expires_at);",
         )
         .map_err(|e| format!("Failed creating SQLite schema: {e}"))?;
 
@@ -726,6 +752,421 @@ fn load_latest_sweep_delta_locked(conn: &Connection) -> Option<SweepDelta> {
         },
     )
     .ok()
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthUserRecord {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub password_hash: String,
+    pub totp_secret_b32: Option<String>,
+    pub totp_enabled: bool,
+    pub totp_last_step: Option<u64>,
+    pub recovery_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthSessionRecord {
+    pub token_hash: String,
+    pub user_id: i64,
+    pub username: String,
+    pub user_agent: String,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+fn map_auth_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthUserRecord> {
+    let rec_json: String = row.get(7)?;
+    let last_step: Option<i64> = row.get(6)?;
+    Ok(AuthUserRecord {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        password_hash: row.get(3)?,
+        totp_secret_b32: row.get(4)?,
+        totp_enabled: row.get::<_, i64>(5)? != 0,
+        totp_last_step: last_step.and_then(|v| u64::try_from(v).ok()),
+        recovery_hashes: serde_json::from_str(&rec_json).unwrap_or_default(),
+    })
+}
+
+impl SqliteStorage {
+    pub fn has_any_auth_user(&self) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM auth_users", [], |row| row.get(0))
+            .unwrap_or(0);
+        count > 0
+    }
+
+    /// Atomically creates the first local admin user. Fails if any user already exists.
+    pub fn create_initial_admin_user(
+        &self,
+        username: &str,
+        display_name: &str,
+        password_hash: &str,
+    ) -> Result<AuthUserRecord, String> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed starting auth setup tx: {e}"))?;
+
+        let existing: i64 = tx
+            .query_row("SELECT COUNT(*) FROM auth_users", [], |row| row.get(0))
+            .map_err(|e| format!("Failed checking existing users: {e}"))?;
+        if existing > 0 {
+            return Err("Initial admin account is already configured.".to_string());
+        }
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        tx.execute(
+            "INSERT INTO auth_users (username, display_name, password_hash, totp_enabled, recovery_hashes_json, created_at, updated_at, last_login_at)
+             VALUES (?1, ?2, ?3, 0, '[]', ?4, ?4, ?4)",
+            params![username, display_name, password_hash, now_str],
+        )
+        .map_err(|e| format!("Failed creating admin user: {e}"))?;
+        let user_id = tx.last_insert_rowid();
+        tx.commit()
+            .map_err(|e| format!("Failed committing admin user: {e}"))?;
+
+        Ok(AuthUserRecord {
+            id: user_id,
+            username: username.to_string(),
+            display_name: display_name.to_string(),
+            password_hash: password_hash.to_string(),
+            totp_secret_b32: None,
+            totp_enabled: false,
+            totp_last_step: None,
+            recovery_hashes: Vec::new(),
+        })
+    }
+
+    pub fn get_auth_user_by_username(&self, username: &str) -> Option<AuthUserRecord> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT id, username, display_name, password_hash, totp_secret_b32,
+                    totp_enabled, totp_last_step, recovery_hashes_json, created_at, last_login_at
+             FROM auth_users WHERE username = ?1",
+            params![username],
+            map_auth_user_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn touch_user_last_login(&self, user_id: i64) {
+        if let Ok(conn) = self.conn.lock() {
+            let now_str = Utc::now().to_rfc3339();
+            let _ = conn.execute(
+                "UPDATE auth_users SET last_login_at = ?1 WHERE id = ?2",
+                params![now_str, user_id],
+            );
+        }
+    }
+
+    pub fn update_auth_user_password(
+        &self,
+        user_id: i64,
+        new_password_hash: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let now_str = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE auth_users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_password_hash, now_str, user_id],
+        )
+        .map_err(|e| format!("Failed updating password: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_pending_totp_secret(&self, user_id: i64, secret_b32: &str) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let now_str = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE auth_users SET totp_secret_b32 = ?1, updated_at = ?2 WHERE id = ?3",
+            params![secret_b32, now_str, user_id],
+        )
+        .map_err(|e| format!("Failed storing pending TOTP secret: {e}"))?;
+        Ok(())
+    }
+
+    pub fn enable_totp_for_user(
+        &self,
+        user_id: i64,
+        recovery_hashes: &[String],
+        last_step: u64,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let now_str = Utc::now().to_rfc3339();
+        let rec_json = serde_json::to_string(recovery_hashes)
+            .map_err(|e| format!("Failed serializing recovery hashes: {e}"))?;
+        conn.execute(
+            "UPDATE auth_users
+             SET totp_enabled = 1, totp_last_step = ?1, recovery_hashes_json = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![last_step as i64, rec_json, now_str, user_id],
+        )
+        .map_err(|e| format!("Failed enabling TOTP: {e}"))?;
+        Ok(())
+    }
+
+    pub fn disable_totp_for_user(&self, user_id: i64) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let now_str = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE auth_users
+             SET totp_enabled = 0, totp_secret_b32 = NULL, totp_last_step = NULL,
+                 recovery_hashes_json = '[]', updated_at = ?1
+             WHERE id = ?2",
+            params![now_str, user_id],
+        )
+        .map_err(|e| format!("Failed disabling TOTP: {e}"))?;
+        Ok(())
+    }
+
+    pub fn update_user_totp_step(&self, user_id: i64, step: u64) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        conn.execute(
+            "UPDATE auth_users SET totp_last_step = ?1 WHERE id = ?2",
+            params![step as i64, user_id],
+        )
+        .map_err(|e| format!("Failed updating TOTP replay step: {e}"))?;
+        Ok(())
+    }
+
+    pub fn update_user_recovery_hashes(
+        &self,
+        user_id: i64,
+        hashes: &[String],
+    ) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let rec_json = serde_json::to_string(hashes)
+            .map_err(|e| format!("Failed serializing recovery hashes: {e}"))?;
+        conn.execute(
+            "UPDATE auth_users SET recovery_hashes_json = ?1 WHERE id = ?2",
+            params![rec_json, user_id],
+        )
+        .map_err(|e| format!("Failed updating recovery hashes: {e}"))?;
+        Ok(())
+    }
+
+    pub fn create_auth_session(
+        &self,
+        token_hash: &str,
+        user_id: i64,
+        username: &str,
+        user_agent: &str,
+        ttl_secs: i64,
+    ) -> Result<AuthSessionRecord, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let now = Utc::now();
+        let expires = now + Duration::seconds(ttl_secs.max(300));
+        let now_str = now.to_rfc3339();
+        let exp_str = expires.to_rfc3339();
+        // Opportunistically purge expired sessions
+        let _ = conn.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1",
+            params![now_str],
+        );
+        conn.execute(
+            "INSERT INTO auth_sessions (token_hash, user_id, username, user_agent, created_at, last_seen_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            params![token_hash, user_id, username, user_agent, now_str, exp_str],
+        )
+        .map_err(|e| format!("Failed creating auth session: {e}"))?;
+
+        Ok(AuthSessionRecord {
+            token_hash: token_hash.to_string(),
+            user_id,
+            username: username.to_string(),
+            user_agent: user_agent.to_string(),
+            created_at: now,
+            last_seen_at: now,
+            expires_at: expires,
+        })
+    }
+
+    pub fn validate_auth_session(
+        &self,
+        token_hash: &str,
+    ) -> Option<(AuthSessionRecord, AuthUserRecord)> {
+        let conn = self.conn.lock().ok()?;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        let session: AuthSessionRecord = conn
+            .query_row(
+                "SELECT token_hash, user_id, username, user_agent, created_at, last_seen_at, expires_at
+                 FROM auth_sessions WHERE token_hash = ?1",
+                params![token_hash],
+                |row| {
+                    let c_str: String = row.get(4)?;
+                    let l_str: String = row.get(5)?;
+                    let e_str: String = row.get(6)?;
+                    Ok(AuthSessionRecord {
+                        token_hash: row.get(0)?,
+                        user_id: row.get(1)?,
+                        username: row.get(2)?,
+                        user_agent: row.get(3)?,
+                        created_at: DateTime::parse_from_rfc3339(&c_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or(now),
+                        last_seen_at: DateTime::parse_from_rfc3339(&l_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or(now),
+                        expires_at: DateTime::parse_from_rfc3339(&e_str)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or(now),
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        if session.expires_at <= now {
+            let _ = conn.execute(
+                "DELETE FROM auth_sessions WHERE token_hash = ?1",
+                params![token_hash],
+            );
+            return None;
+        }
+
+        let user = conn
+            .query_row(
+                "SELECT id, username, display_name, password_hash, totp_secret_b32,
+                        totp_enabled, totp_last_step, recovery_hashes_json, created_at, last_login_at
+                 FROM auth_users WHERE id = ?1",
+                params![session.user_id],
+                map_auth_user_row,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+
+        let _ = conn.execute(
+            "UPDATE auth_sessions SET last_seen_at = ?1 WHERE token_hash = ?2",
+            params![now_str, token_hash],
+        );
+
+        Some((session, user))
+    }
+
+    pub fn delete_auth_session(&self, token_hash: &str) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "DELETE FROM auth_sessions WHERE token_hash = ?1",
+                params![token_hash],
+            );
+        }
+    }
+
+    pub fn revoke_other_auth_sessions(
+        &self,
+        user_id: i64,
+        keep_token_hash: Option<&str>,
+    ) -> Result<usize, String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        let deleted = match keep_token_hash {
+            Some(keep) => conn
+                .execute(
+                    "DELETE FROM auth_sessions WHERE user_id = ?1 AND token_hash != ?2",
+                    params![user_id, keep],
+                )
+                .map_err(|e| format!("Failed revoking other sessions: {e}"))?,
+            None => conn
+                .execute(
+                    "DELETE FROM auth_sessions WHERE user_id = ?1",
+                    params![user_id],
+                )
+                .map_err(|e| format!("Failed revoking user sessions: {e}"))?,
+        };
+        Ok(deleted)
+    }
+
+    pub fn list_user_sessions(&self, user_id: i64) -> Vec<AuthSessionRecord> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut stmt = match conn.prepare(
+            "SELECT token_hash, user_id, username, user_agent, created_at, last_seen_at, expires_at
+             FROM auth_sessions WHERE user_id = ?1 AND expires_at > ?2
+             ORDER BY last_seen_at DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt
+            .query_map(params![user_id, now_str], |row| {
+                let c_str: String = row.get(4)?;
+                let l_str: String = row.get(5)?;
+                let e_str: String = row.get(6)?;
+                Ok(AuthSessionRecord {
+                    token_hash: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    user_agent: row.get(3)?,
+                    created_at: DateTime::parse_from_rfc3339(&c_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or(now),
+                    last_seen_at: DateTime::parse_from_rfc3339(&l_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or(now),
+                    expires_at: DateTime::parse_from_rfc3339(&e_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or(now),
+                })
+            })
+            .ok();
+        rows.map(|r| r.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// CLI emergency recovery (`--reset-auth`): clears all local users and active sessions.
+    pub fn reset_all_auth(&self) -> Result<(), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| "DB mutex poisoned".to_string())?;
+        conn.execute_batch("DELETE FROM auth_sessions; DELETE FROM auth_users;")
+            .map_err(|e| format!("Failed resetting auth tables: {e}"))?;
+        Ok(())
+    }
 }
 
 fn restrict_db_permissions(path: &Path) {

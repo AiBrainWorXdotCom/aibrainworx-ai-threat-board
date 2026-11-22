@@ -11,15 +11,16 @@ import {
   Bot,
   Cpu,
   Globe,
-  KeyRound,
   Layers,
   LogOut,
   Newspaper,
   ShieldAlert,
 } from 'lucide-react';
-import { IS_DEMO_MODE, api, playAlertChime } from './api';
+import { ApiError, IS_DEMO_MODE, api, playAlertChime } from './api';
+import { AccountSecurityModal } from './components/AccountSecurityModal';
 import { AiAnalystView } from './components/AiAnalystView';
 import { AiModelsView } from './components/AiModelsView';
+import { AuthScreen } from './components/AuthScreen';
 import { FeedsAndAlertsView } from './components/FeedsAndAlertsView';
 import { InvestigationDrawer } from './components/InvestigationDrawer';
 import { MyStackView } from './components/MyStackView';
@@ -57,9 +58,7 @@ function DashboardWorkspace({
     }
   });
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
-  const [tokenInput, setTokenInput] = useState('');
-  const [loginError, setLoginError] = useState<string | null>(null);
-  const [loggingIn, setLoggingIn] = useState(false);
+  const [securityModalOpen, setSecurityModalOpen] = useState(false);
 
   const [drawerVulnId, setDrawerVulnId] = useState<string | null>(null);
   const [drawerInitialVuln, setDrawerInitialVuln] = useState<Vulnerability | null>(null);
@@ -79,17 +78,37 @@ function DashboardWorkspace({
     });
   };
 
+  const refreshAuthStatus = useCallback(async () => {
+    const status = await api.getAuthStatus();
+    setAuthStatus(status);
+    return status;
+  }, []);
+
   const loadDashboard = useCallback(async () => {
     try {
       const payload = await api.getDashboard();
       setDashboard(payload);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('401')) {
+      const is401 =
+        (err instanceof ApiError && err.status === 401) ||
+        (err instanceof Error && err.message.includes('401'));
+      if (is401) {
         setAuthStatus((prev) =>
           prev
             ? { ...prev, authenticated: false }
-            : { auth_required: true, authenticated: false, wallboard_mode: false, offline_mode: false }
+            : {
+                auth_required: true,
+                setup_required: false,
+                authenticated: false,
+                username: null,
+                display_name: null,
+                totp_enabled: false,
+                recovery_codes_remaining: 0,
+                token_auth_enabled: false,
+                wallboard_mode: false,
+                offline_mode: false,
+                no_auth_mode: false,
+              }
         );
       }
     } finally {
@@ -273,33 +292,21 @@ function DashboardWorkspace({
   const serverWallboard = dashboard?.server_mode.wallboard_mode || authStatus?.wallboard_mode || false;
   const serverOffline = dashboard?.server_mode.offline_mode || authStatus?.offline_mode || false;
   const authRequired = authStatus?.auth_required || dashboard?.server_mode.auth_required || false;
-  const authenticated = authStatus?.authenticated ?? true;
+  const authenticated = authStatus?.authenticated ?? false;
 
-  const handleLogin = async () => {
-    if (!tokenInput.trim() || loggingIn) return;
-    setLoggingIn(true);
-    setLoginError(null);
-    try {
-      await api.login(tokenInput.trim());
-      setTokenInput('');
-      setAuthStatus((prev) =>
-        prev
-          ? { ...prev, authenticated: true }
-          : { auth_required: true, authenticated: true, wallboard_mode: false, offline_mode: false }
-      );
-      setLoading(true);
-      await loadDashboard();
-    } catch (err) {
-      setLoginError(err instanceof Error ? err.message : 'Invalid access token');
-    } finally {
-      setLoggingIn(false);
-    }
+  const handleAuthenticated = async () => {
+    setLoading(true);
+    await refreshAuthStatus();
+    await loadDashboard();
   };
 
   const handleLogout = async () => {
+    setSecurityModalOpen(false);
     await api.logout();
     setDashboard(null);
-    setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : prev));
+    await refreshAuthStatus().catch(() => {
+      setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : prev));
+    });
   };
 
   const navSections: {
@@ -371,62 +378,20 @@ function DashboardWorkspace({
     },
   ];
 
-  if (authRequired && !authenticated) {
+  if (authStatus === null) {
     return (
-      <div
-        className="abw-shell"
-        style={{
-          minHeight: '100vh',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 24,
-        }}
-      >
-        <section className="abw-panel" style={{ width: '100%', maxWidth: 420 }}>
-          <div className="abw-panel-head">
-            <span className="abw-panel-title">
-              <KeyRound size={15} color="#66efab" />
-              AiBrainWorX Threat Board — Access Token Required
-            </span>
-          </div>
-          <div className="abw-panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <Text type="supporting" size="sm">
-              This instance is bound to a non-loopback interface or protected with AUTH_TOKEN. Enter your session access token (or start with default 127.0.0.1 for local zero-auth use).
-            </Text>
-            <input
-              type="password"
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') void handleLogin();
-              }}
-              placeholder="Paste AUTH_TOKEN..."
-              style={{
-                width: '100%',
-                padding: '9px 10px',
-                border: '1px solid var(--soc-border-strong)',
-                background: 'var(--soc-surface)',
-                color: 'var(--soc-text)',
-                fontFamily: 'ui-monospace, monospace',
-                fontSize: 13,
-              }}
-            />
-            {loginError && (
-              <Text size="xsm" style={{ color: '#fca5a5' }}>
-                {loginError}
-              </Text>
-            )}
-            <Button
-              label={loggingIn ? 'Authenticating...' : 'Unlock Threat Board'}
-              variant="primary"
-              isLoading={loggingIn}
-              onClick={() => void handleLogin()}
-            />
-          </div>
-        </section>
+      <div className="abw-auth-backdrop">
+        <div className="abw-auth-grid" aria-hidden="true" />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, zIndex: 2 }}>
+          <Spinner />
+          <Text weight="semibold">Verifying local session...</Text>
+        </div>
       </div>
     );
+  }
+
+  if (authRequired && !authenticated) {
+    return <AuthScreen authStatus={authStatus} onAuthenticated={handleAuthenticated} />;
   }
 
   return (
@@ -447,6 +412,9 @@ function DashboardWorkspace({
         opsecMode={opsecMode}
         wallboardMode={serverWallboard}
         offlineMode={serverOffline}
+        authRequired={authRequired}
+        username={authStatus.username}
+        totpEnabled={authStatus.totp_enabled}
         onToggleSound={() => setSoundEnabled((s) => !s)}
         onToggleDarkMode={onToggleDarkMode}
         onToggleOpsecMode={toggleOpsecMode}
@@ -454,6 +422,8 @@ function DashboardWorkspace({
         onRefreshNow={() => void handleRefreshNow()}
         onOpenAlerts={() => setActiveTab('alerts')}
         onOpenAiModels={() => setActiveTab('models')}
+        onOpenSecurity={() => setSecurityModalOpen(true)}
+        onLogout={() => void handleLogout()}
       />
 
       <div className="abw-workspace">
@@ -593,6 +563,16 @@ function DashboardWorkspace({
         }}
         onSelectVulnId={handleSelectVulnId}
         onTriageUpdated={() => void loadDashboard()}
+      />
+
+      <AccountSecurityModal
+        open={securityModalOpen}
+        authStatus={authStatus}
+        onClose={() => setSecurityModalOpen(false)}
+        onRefreshAuth={async () => {
+          await refreshAuthStatus();
+        }}
+        onLogout={handleLogout}
       />
     </div>
   );
