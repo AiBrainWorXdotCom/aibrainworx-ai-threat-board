@@ -2,6 +2,16 @@
 
 All notable changes to **AiBrainWorX AI CyberSecurity Threat Analysis Board** are documented here.
 
+## v0.3.0 (2026-11-22)
+
+### Local Authentication, Hardened Sessions & Offline TOTP 2FA
+- **First-Run Local Admin Setup & SOC Login Screen:** Added a dedicated dark-SOC First-Run Admin Setup wizard (live 4-segment password strength meter, ≥10-character minimum) and Sign-In screen enabled by default on both loopback and LAN binds.
+- **Argon2id Password Hashing:** Passwords are hashed locally with OWASP-recommended Argon2id parameters (`m=19456, t=2, p=1`, 128-bit CSPRNG salt) and verified in constant time (with dummy Argon2id verification for unknown usernames to resist timing enumeration).
+- **256-Bit Ephemeral HttpOnly Sessions (`auth_sessions`):** Issues CSPRNG 256-bit `HttpOnly; SameSite=Strict` cookies (auto-`Secure` behind HTTPS), persists only `SHA-256` token hashes in SQLite (excluded from offline snapshots), supports active session listing, one-click revocation of other sessions, and immediate server-side revocation on logout or password rotation.
+- **Brute-Force Rate Limiting & Lockout:** Enforces progressive per-client/username lockout (`60s → 5m → 15m`) returning `429 Too Many Requests` + `Retry-After` after 5 failed attempts.
+- **Offline RFC 6238 TOTP 2FA & Recovery Codes:** Built-in authenticator app enrollment with **100% locally generated base64 SVG QR codes** (zero external network calls), ±30s drift tolerance with replay-step protection, and 8 single-use hashed recovery codes.
+- **Account Security Modal & Recovery Flags:** Manage 2FA, password rotation, and active sessions from the `@username` top-bar control; use `--reset-auth` for local CLI credential recovery or `--no-auth` for explicit loopback-only (`127.0.0.1`) kiosk bypass (ignored on non-loopback binds).
+
 ## v0.2.0 (2026-11-22)
 
 ### Security-First Architecture Upgrades

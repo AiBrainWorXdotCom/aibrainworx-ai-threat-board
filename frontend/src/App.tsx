@@ -93,28 +93,30 @@ function DashboardWorkspace({
         (err instanceof ApiError && err.status === 401) ||
         (err instanceof Error && err.message.includes('401'));
       if (is401) {
-        setAuthStatus((prev) =>
-          prev
-            ? { ...prev, authenticated: false }
-            : {
-                auth_required: true,
-                setup_required: false,
-                authenticated: false,
-                username: null,
-                display_name: null,
-                totp_enabled: false,
-                recovery_codes_remaining: 0,
-                token_auth_enabled: false,
-                wallboard_mode: false,
-                offline_mode: false,
-                no_auth_mode: false,
-              }
-        );
+        void refreshAuthStatus().catch(() => {
+          setAuthStatus((prev) =>
+            prev
+              ? { ...prev, authenticated: false }
+              : {
+                  auth_required: true,
+                  setup_required: false,
+                  authenticated: false,
+                  username: null,
+                  display_name: null,
+                  totp_enabled: false,
+                  recovery_codes_remaining: 0,
+                  token_auth_enabled: false,
+                  wallboard_mode: false,
+                  offline_mode: false,
+                  no_auth_mode: false,
+                }
+          );
+        });
       }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [refreshAuthStatus]);
 
   useEffect(() => {
     let active = true;

@@ -1,6 +1,6 @@
 [package]
 name = "aibrainworx-threat-board"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "AiBrainWorX AI Cybersecurity Threat Analysis Board - Rust Backend"
 

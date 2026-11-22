@@ -2,12 +2,14 @@
 
 ## Threat Model & Local-First Posture
 
-**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.2.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, SSRF containment, credential isolation, and untrusted telemetry sanitization:
+**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.3.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, SSRF containment, credential isolation, and untrusted telemetry sanitization:
 
-1. **Loopback Default + Non-Loopback Access Control:**
-   - By default, the server binds strictly to `127.0.0.1:8080` with `Host` header validation (`403 Forbidden` on non-loopback `Host` headers to defeat DNS rebinding) and strict `Origin` / `Sec-Fetch-Site` enforcement.
-   - Binding to any non-loopback address (`--bind 0.0.0.0` or LAN IP) or setting `AUTH_TOKEN` enforces constant-time Bearer token / `HttpOnly; SameSite=Strict` session-cookie authentication (`abw_session`) across `/api/*` endpoints (with only `/api/health` and `/api/auth/*` exempt).
-   - If started non-loopback without `AUTH_TOKEN`, a cryptographically random 24-byte hex token is generated at startup via `getrandom`.
+1. **Local Argon2id Authentication, Ephemeral Sessions & Offline TOTP 2FA:**
+   - Authentication is enabled by default even on `127.0.0.1:8080`. On first run, the browser opens the **First-Run Admin Setup** wizard (`POST /api/auth/setup`, permanently locked with `403` once an account exists).
+   - Passwords are stored exclusively as **Argon2id** hashes (`m=19456, t=2, p=1`, 128-bit CSPRNG salt) in local SQLite (`auth_users`, never exported in snapshots), with dummy Argon2id verification on missing usernames to prevent timing enumeration.
+   - Sign-in issues a 256-bit CSPRNG session token in an `HttpOnly; SameSite=Strict` cookie (`abw_session`, plus `Secure` when behind HTTPS); only `SHA-256(token)` is stored in `auth_sessions`, enabling instant server-side revocation on logout, password change, or "Sign Out Other Sessions".
+   - Progressive brute-force lockout (`60s → 5m → 15m`, `429 Retry-After`) activates after 5 failed attempts. Optional **RFC 6238 TOTP 2FA** renders QR codes 100% locally as inline base64 SVGs with replay-step tracking and 8 single-use hashed recovery codes.
+   - Local loopback kiosk bypass (`--no-auth`) is strictly rejected on non-loopback binds (`0.0.0.0` / LAN). `Host` header validation (`403` on DNS rebinding), `Origin`/`Sec-Fetch-Site` checks, and `AUTH_TOKEN` Bearer automation support remain enforced across `/api/*`. Use `--reset-auth` locally if emergency credential reset is required.
 
 2. **DNS-Pinned SSRF Defense & Zero-Redirect Outbound Clients:**
    - All user-supplied outbound URLs (BYO AI providers, BYO custom threat feeds, and outbound webhooks) pass `security::validate_outbound_url` before any socket opens.
