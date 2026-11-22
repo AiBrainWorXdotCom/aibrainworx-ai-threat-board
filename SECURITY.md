@@ -1,27 +1,40 @@
-# Security Policy — AiBrainWorX CyberSecurity Threat Analysis Board
+# Security Architecture & Vulnerability Disclosure Policy
 
-## Deployment & Threat Model
+## Threat Model & Local-First Posture
 
-AiBrainWorX CyberSecurity Threat Analysis Board is designed as a **single-user local SOC workstation application** bound strictly to loopback (`127.0.0.1:8080` by default).
+**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.2.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, SSRF containment, credential isolation, and untrusted telemetry sanitization:
 
-- **No Built-In Multi-User Authentication:** Do **not** expose this service directly to a public network, untrusted LAN, or shared multi-tenant host without placing it behind a TLS reverse proxy enforcing authentication and origin checks.
-- **DNS Rebinding & CSRF Protections:** The server rejects requests whose `Host` header is not loopback (`127.0.0.1`, `localhost`, `[::1]`) and enforces an explicit loopback CORS allowlist alongside `Origin` / `Sec-Fetch-Site` validation on `/api/*`.
+1. **Loopback Default + Non-Loopback Access Control:**
+   - By default, the server binds strictly to `127.0.0.1:8080` with `Host` header validation (`403 Forbidden` on non-loopback `Host` headers to defeat DNS rebinding) and strict `Origin` / `Sec-Fetch-Site` enforcement.
+   - Binding to any non-loopback address (`--bind 0.0.0.0` or LAN IP) or setting `AUTH_TOKEN` enforces constant-time Bearer token / `HttpOnly; SameSite=Strict` session-cookie authentication (`abw_session`) across `/api/*` endpoints (with only `/api/health` and `/api/auth/*` exempt).
+   - If started non-loopback without `AUTH_TOKEN`, a cryptographically random 24-byte hex token is generated at startup via `getrandom`.
 
-## API Key Handling Best Practices
+2. **DNS-Pinned SSRF Defense & Zero-Redirect Outbound Clients:**
+   - All user-supplied outbound URLs (BYO AI providers, BYO custom threat feeds, and outbound webhooks) pass `security::validate_outbound_url` before any socket opens.
+   - Hostnames are resolved via DNS and every returned IP (including unmapped `::ffff:x.x.x.x` IPv4-mapped IPv6 addresses) is validated before pinning the resolved addresses directly into a zero-redirect `reqwest` client (`Policy::none()` + `resolve_to_addrs`) to block DNS-rebinding TOCTOU and 302 redirect pivots.
+   - Custom feeds and webhooks enforce strict `https://` public IPs only (blocking loopback, RFC1918, ULA, CGNAT, link-local, and cloud metadata IPs like `169.254.169.254` / `100.100.100.200`).
+   - Private LAN AI servers (e.g., `192.168.x.x` Ollama/LM Studio) are blocked unless explicitly opted into via `allow_lan_endpoints`, and link-local/metadata ranges remain unconditionally blocked.
 
-- **Environment Variables Preferred:** For cloud AI providers (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `CUSTOM_AI_API_KEY`), pass credentials via process environment variables.
-- **Session-Only Memory Storage:** API keys entered in the **AI Models** UI are held in server RAM for the current process lifetime and are **never** written to `data/threat_store.json` or echoed in plaintext by `GET /api/ai/config`.
-- **Endpoint Isolation:** Environment keys for built-in cloud presets are only attached when targeting each provider's official default endpoint URL, never on overridden `base_url` values, and HTTP redirects are disabled on outbound AI client calls.
-- **Local Zero-Key Mode:** Running with `Built-in Rust Engine` or local runtimes (`Ollama`, `LM Studio`, `llama.cpp` / `vLLM`) keeps threat telemetry completely on your machine with zero cloud API keys required.
+3. **Secret Isolation & Optional OS Keychain Vault:**
+   - AI provider API keys and webhook HMAC signing secrets are marked `#[serde(skip)]` and are **never** written to SQLite, `data/`, API responses, logs, or offline snapshots.
+   - Slack/Discord/Teams webhook bearer URLs are masked (`url_masked`) on all API read responses.
+   - Users may optionally opt into OS native Keychain storage (`keyring` v3: Windows Credential Manager, macOS Keychain, Linux Secret Service). Session RAM remains the default.
 
-## Hardening Controls Included
+4. **Embedded SQLite Storage (`WAL` + `FTS5`) & Offline Snapshots:**
+   - Local intelligence persists in `data/threat_board.db` with `WAL` journaling and restrictive `0600` POSIX permissions.
+   - Portable Offline Snapshots exclude secrets (`ai_config` keys, webhooks) and verify a deterministic `SHA-256` digest prior to ingestion.
 
-- Strict HTTP security headers (`Content-Security-Policy` with `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`).
-- Header-based authentication (`x-goog-api-key`) for Gemini instead of query-string secrets, plus `.without_url()` error redaction across HTTP clients.
-- `http://` / `https://` scheme validation and credential stripping on all ingested feed URLs and frontend external links.
-- Bounded response body reads (2 MB cap for AI endpoints, 12 MB cap for public feeds) and 256 KB API JSON request body limits.
-- Untrusted-telemetry boundary framing on prompts sent to external or local LLMs.
+5. **Untrusted Feed, Prompt Injection & Markdown Sanitization:**
+   - External telemetry passed to LLMs is delimited inside `<untrusted_telemetry_data>` boundaries with explicit system prompt instructions and invisible Unicode stripping (`U+E0000..=U+E007F` Tags, bidi overrides, zero-width & C0/C1 controls).
+   - Both Rust backend and React frontend sanitize returned Markdown before display: blocking `<script>`, `<iframe>`, `<svg>`, remote Markdown images (`![alt](url)` tracking pixels), and non-`http(s)` URI schemes (`javascript:`, `data:`, `file:`).
+   - Strict `Content-Security-Policy` headers (`script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'`) and `Cache-Control: no-store` protect sensitive endpoints and `index.html`.
+
+6. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
+   - **OPSEC Redact Mode** masks public attacker IPs, C2 endpoints, and phishing domains in the UI for safe screen-sharing and demos.
+   - Phishing URLs render defanged (`hxxps://`, `[.]`) as non-clickable text.
+   - Spreadsheet CSV exports escape leading `=`, `+`, `-`, `@`, `\t`, and `\r` characters to neutralize formula injection.
+   - `--wallboard` enforces `403 Forbidden` on all configuration/mutation endpoints; `--offline` disables all outbound threat feed sweeps.
 
 ## Reporting a Vulnerability
 
-If you discover a security issue in AiBrainWorX, please report it privately to the maintainers before opening a public issue so it can be verified and patched first.
+Do **not** open public issues with exploitable local PoCs, real credentials, or sensitive threat telemetry. Report security issues responsibly via [GitHub Security Advisories](https://github.com/AiBrainWorXdotCom/aibrainworx-ai-threat-board/security/advisories/new).

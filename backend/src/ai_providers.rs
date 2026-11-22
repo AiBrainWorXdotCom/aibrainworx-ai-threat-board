@@ -7,6 +7,11 @@ use crate::models::{
     AiConfig, AiConfigPublic, AiConfigUpdate, AiModelsResponse, AiProviderKind, AiProviderPreset,
     AiTestResponse,
 };
+use crate::security::{
+    build_pinned_http_client, is_ip_allowed, keychain_delete, keychain_get, keychain_is_available,
+    keychain_set, sanitize_llm_markdown, validate_outbound_url, OutboundUrlPolicy,
+    KEYCHAIN_ACCOUNT_AI_API_KEY,
+};
 
 const MAX_AI_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AI_ERROR_BODY_BYTES: usize = 32 * 1024;
@@ -111,7 +116,11 @@ fn is_loopback_hostname(host: &str) -> bool {
     false
 }
 
-pub fn validate_ai_base_url(kind: AiProviderKind, raw: &str) -> Result<String, String> {
+pub fn validate_ai_base_url_with_policy(
+    kind: AiProviderKind,
+    raw: &str,
+    allow_lan: bool,
+) -> Result<String, String> {
     if kind == AiProviderKind::Builtin {
         return Ok(String::new());
     }
@@ -140,41 +149,25 @@ pub fn validate_ai_base_url(kind: AiProviderKind, raw: &str) -> Result<String, S
     if matches!(
         host_lower.as_str(),
         "metadata.google.internal" | "metadata.goog" | "instance-data"
-    ) {
-        return Err("Access to cloud metadata hostnames is blocked".to_string());
+    ) || (!allow_lan && (host_lower.ends_with(".local") || host_lower.ends_with(".internal")))
+    {
+        return Err(
+            "Access to cloud metadata or unpermitted internal hostnames is blocked".to_string(),
+        );
     }
 
     let ip_str = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = ip_str.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                if v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-                {
-                    return Err("Link-local, unspecified, broadcast, and multicast IPv4 addresses are blocked".to_string());
-                }
-            }
-            IpAddr::V6(v6) => {
-                let is_v6_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-                let mapped_blocked = v6
-                    .to_ipv4_mapped()
-                    .map(|v4| {
-                        v4.is_link_local()
-                            || v4.is_unspecified()
-                            || v4.is_broadcast()
-                            || v4.is_multicast()
-                    })
-                    .unwrap_or(false);
-                if v6.is_unspecified() || v6.is_multicast() || is_v6_link_local || mapped_blocked {
-                    return Err("Link-local, unspecified, and multicast IPv6 addresses are blocked".to_string());
-                }
-            }
+        if !is_ip_allowed(ip, OutboundUrlPolicy::AiProvider { allow_lan }) {
+            return Err(
+                "Target IP is blocked by outbound SSRF policy (enable explicit LAN endpoints if using a private LAN server)"
+                    .to_string(),
+            );
         }
     }
 
-    if requires_api_key(kind) && parsed.scheme() != "https" && !is_loopback_hostname(host) {
+    let allow_http_local_or_lan = is_loopback_hostname(host) || allow_lan;
+    if requires_api_key(kind) && parsed.scheme() != "https" && !allow_http_local_or_lan {
         return Err(format!(
             "{} requires https:// for non-loopback endpoints",
             provider_display_name(kind)
@@ -373,6 +366,10 @@ pub fn to_public_config(cfg: &AiConfig) -> AiConfigPublic {
         false
     };
     let masked = mask_secret(&cfg.api_key);
+    let keychain_available = keychain_is_available();
+    let keychain_has_key = cfg.save_key_to_keychain
+        && keychain_available
+        && matches!(keychain_get(KEYCHAIN_ACCOUNT_AI_API_KEY), Ok(Some(s)) if !s.is_empty());
 
     AiConfigPublic {
         provider: cfg.provider,
@@ -381,11 +378,15 @@ pub fn to_public_config(cfg: &AiConfig) -> AiConfigPublic {
         has_api_key: !cfg.api_key.trim().is_empty(),
         api_key_masked: masked,
         env_key_present: env_present,
+        keychain_available,
+        keychain_has_key,
         temperature: cfg.temperature,
         max_tokens: cfg.max_tokens,
         timeout_secs: cfg.timeout_secs,
         system_prompt: cfg.system_prompt.clone(),
         enrich_briefing: cfg.enrich_briefing,
+        allow_lan_endpoints: cfg.allow_lan_endpoints,
+        save_key_to_keychain: cfg.save_key_to_keychain,
         active_label: active_label(cfg),
         presets: provider_presets(),
     }
@@ -395,6 +396,10 @@ pub fn apply_config_update(cfg: &mut AiConfig, upd: AiConfigUpdate) -> Result<()
     let prev_provider = cfg.provider;
     let prev_base = effective_base_url(cfg);
 
+    if let Some(lan) = upd.allow_lan_endpoints {
+        cfg.allow_lan_endpoints = lan;
+    }
+
     let next_provider = upd.provider.unwrap_or(prev_provider);
     let next_base_raw = match upd.base_url.as_deref().map(str::trim) {
         Some(url) if !url.is_empty() => url.to_string(),
@@ -402,7 +407,8 @@ pub fn apply_config_update(cfg: &mut AiConfig, upd: AiConfigUpdate) -> Result<()
         None if next_provider != prev_provider => default_base_url(next_provider).to_string(),
         None => prev_base.clone(),
     };
-    let next_base = validate_ai_base_url(next_provider, &next_base_raw)?;
+    let next_base =
+        validate_ai_base_url_with_policy(next_provider, &next_base_raw, cfg.allow_lan_endpoints)?;
 
     let next_model = match upd.model.as_deref().map(str::trim) {
         Some(m) if !m.is_empty() => validate_model_name(m)?,
@@ -414,6 +420,7 @@ pub fn apply_config_update(cfg: &mut AiConfig, upd: AiConfigUpdate) -> Result<()
     // Never carry a session API key across a provider or endpoint URL change.
     if next_provider != prev_provider || !next_base.eq_ignore_ascii_case(&prev_base) {
         cfg.api_key.clear();
+        let _ = keychain_delete(KEYCHAIN_ACCOUNT_AI_API_KEY);
     }
 
     cfg.provider = next_provider;
@@ -422,11 +429,23 @@ pub fn apply_config_update(cfg: &mut AiConfig, upd: AiConfigUpdate) -> Result<()
 
     if upd.clear_api_key.unwrap_or(false) {
         cfg.api_key.clear();
+        let _ = keychain_delete(KEYCHAIN_ACCOUNT_AI_API_KEY);
     } else if let Some(key) = upd.api_key {
         let t = key.trim();
         if !t.is_empty() {
             cfg.api_key = t.to_string();
         }
+    }
+
+    if let Some(save_kc) = upd.save_key_to_keychain {
+        cfg.save_key_to_keychain = save_kc;
+        if !save_kc {
+            let _ = keychain_delete(KEYCHAIN_ACCOUNT_AI_API_KEY);
+        }
+    }
+
+    if cfg.save_key_to_keychain && !cfg.api_key.trim().is_empty() {
+        keychain_set(KEYCHAIN_ACCOUNT_AI_API_KEY, &cfg.api_key)?;
     }
 
     if let Some(temp) = upd.temperature {
@@ -492,7 +511,10 @@ async fn read_bounded_bytes(
 ) -> Result<Vec<u8>, String> {
     if let Some(len) = resp.content_length() {
         if len > max_bytes as u64 {
-            return Err(format!("Upstream response exceeded {} byte limit", max_bytes));
+            return Err(format!(
+                "Upstream response exceeded {} byte limit",
+                max_bytes
+            ));
         }
     }
     let mut buf = Vec::new();
@@ -502,7 +524,10 @@ async fn read_bounded_bytes(
         .map_err(|e| format!("Stream read error: {}", e.without_url()))?
     {
         if buf.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(format!("Upstream response exceeded {} byte limit", max_bytes));
+            return Err(format!(
+                "Upstream response exceeded {} byte limit",
+                max_bytes
+            ));
         }
         buf.extend_from_slice(&chunk);
     }
@@ -516,9 +541,13 @@ async fn read_bounded_error_text(resp: reqwest::Response) -> String {
     }
 }
 
-pub async fn list_models(http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResponse {
+pub async fn list_models(_http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResponse {
     let provider = cfg.provider;
-    let base = match validate_ai_base_url(provider, &effective_base_url(cfg)) {
+    let base = match validate_ai_base_url_with_policy(
+        provider,
+        &effective_base_url(cfg),
+        cfg.allow_lan_endpoints,
+    ) {
         Ok(b) => b,
         Err(msg) => {
             return AiModelsResponse {
@@ -530,6 +559,49 @@ pub async fn list_models(http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResp
         }
     };
     let key = resolve_effective_key(cfg);
+
+    if provider == AiProviderKind::Builtin {
+        return AiModelsResponse {
+            ok: true,
+            models: vec!["local-threat-graph-v1".to_string()],
+            source: provider_display_name(provider).to_string(),
+            error: None,
+        };
+    }
+
+    let validated = match validate_outbound_url(
+        &base,
+        OutboundUrlPolicy::AiProvider {
+            allow_lan: cfg.allow_lan_endpoints,
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            return AiModelsResponse {
+                ok: false,
+                models: Vec::new(),
+                source: base,
+                error: Some(msg),
+            };
+        }
+    };
+    let http = match build_pinned_http_client(
+        &validated,
+        Duration::from_secs(12),
+        "AiBrainWorX-ThreatBoard/0.2",
+    ) {
+        Ok(c) => c,
+        Err(msg) => {
+            return AiModelsResponse {
+                ok: false,
+                models: Vec::new(),
+                source: base,
+                error: Some(msg),
+            };
+        }
+    };
 
     match provider {
         AiProviderKind::Builtin => AiModelsResponse {
@@ -615,7 +687,8 @@ pub async fn list_models(http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResp
                     models: Vec::new(),
                     source: base,
                     error: Some(
-                        "Enter a Gemini API key (or set GEMINI_API_KEY) to list models.".to_string(),
+                        "Enter a Gemini API key (or set GEMINI_API_KEY) to list models."
+                            .to_string(),
                     ),
                 };
             };
@@ -659,9 +732,9 @@ pub async fn list_models(http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResp
                                             m.get("supportedGenerationMethods")
                                                 .and_then(|g| g.as_array())
                                                 .map(|methods| {
-                                                    methods
-                                                        .iter()
-                                                        .any(|s| s.as_str() == Some("generateContent"))
+                                                    methods.iter().any(|s| {
+                                                        s.as_str() == Some("generateContent")
+                                                    })
                                                 })
                                                 .unwrap_or(false)
                                         })
@@ -876,7 +949,7 @@ pub async fn list_models(http: &reqwest::Client, cfg: &AiConfig) -> AiModelsResp
 }
 
 pub async fn generate_completion(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     cfg: &AiConfig,
     system_prompt: &str,
     user_prompt: &str,
@@ -885,10 +958,22 @@ pub async fn generate_completion(
         return Err("Built-in Rust Engine selected".to_string());
     }
 
-    let base = validate_ai_base_url(cfg.provider, &effective_base_url(cfg))?;
+    let base = validate_ai_base_url_with_policy(
+        cfg.provider,
+        &effective_base_url(cfg),
+        cfg.allow_lan_endpoints,
+    )?;
     let model = validate_model_name(&effective_model(cfg))?;
     let key = resolve_effective_key(cfg);
     let timeout = Duration::from_secs(cfg.timeout_secs.clamp(5, 300));
+    let validated = validate_outbound_url(
+        &base,
+        OutboundUrlPolicy::AiProvider {
+            allow_lan: cfg.allow_lan_endpoints,
+        },
+    )
+    .await?;
+    let http = build_pinned_http_client(&validated, timeout, "AiBrainWorX-ThreatBoard/0.2")?;
     let t0 = Instant::now();
 
     match cfg.provider {
@@ -966,7 +1051,12 @@ pub async fn generate_completion(
                     .send(),
             )
             .await
-            .map_err(|_| format!("Timed out after {}s waiting for Anthropic", timeout.as_secs()))?
+            .map_err(|_| {
+                format!(
+                    "Timed out after {}s waiting for Anthropic",
+                    timeout.as_secs()
+                )
+            })?
             .map_err(|e| format!("Anthropic request error: {}", e.without_url()))?;
 
             let status = resp.status();
@@ -1125,8 +1215,7 @@ pub async fn test_connection(http: &reqwest::Client, cfg: &AiConfig) -> AiTestRe
             provider_label,
             model,
             reply: Some(
-                "Built-in Local Rust Threat Graph active (zero external dependencies)."
-                    .to_string(),
+                "Built-in Local Rust Threat Graph active (zero external dependencies).".to_string(),
             ),
             error: None,
         };
@@ -1145,7 +1234,7 @@ pub async fn test_connection(http: &reqwest::Client, cfg: &AiConfig) -> AiTestRe
             latency_ms,
             provider_label,
             model,
-            reply: Some(reply),
+            reply: Some(sanitize_llm_markdown(&reply)),
             error: None,
         },
         Err(err) => AiTestResponse {
@@ -1156,5 +1245,38 @@ pub async fn test_connection(http: &reqwest::Client, cfg: &AiConfig) -> AiTestRe
             reply: None,
             error: Some(err),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_url_policy_enforces_lan_opt_in_and_loopback() {
+        assert!(validate_ai_base_url_with_policy(
+            AiProviderKind::Ollama,
+            "http://127.0.0.1:11434/v1",
+            false
+        )
+        .is_ok());
+        assert!(validate_ai_base_url_with_policy(
+            AiProviderKind::Ollama,
+            "http://192.168.1.50:11434/v1",
+            false
+        )
+        .is_err());
+        assert!(validate_ai_base_url_with_policy(
+            AiProviderKind::Ollama,
+            "http://192.168.1.50:11434/v1",
+            true
+        )
+        .is_ok());
+        assert!(validate_ai_base_url_with_policy(
+            AiProviderKind::OpenAi,
+            "https://169.254.169.254/v1",
+            true
+        )
+        .is_err());
     }
 }

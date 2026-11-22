@@ -16,6 +16,8 @@ import type {
 } from '../types';
 
 interface AiModelsViewProps {
+  readOnly?: boolean;
+  opsecMode?: boolean;
   onConfigSaved: () => void;
 }
 
@@ -33,12 +35,18 @@ function extractApiError(err: unknown): string {
   return msg;
 }
 
-export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
+export function AiModelsView({
+  readOnly = false,
+  opsecMode = false,
+  onConfigSaved,
+}: AiModelsViewProps) {
   const [config, setConfig] = useState<AiConfigPublic | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<AiProviderKind>('builtin');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
+  const [allowLan, setAllowLan] = useState(false);
+  const [saveKeychain, setSaveKeychain] = useState(false);
   const [temperature, setTemperature] = useState('0.2');
   const [maxTokens, setMaxTokens] = useState('1600');
   const [timeoutSecs, setTimeoutSecs] = useState('60');
@@ -58,6 +66,8 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
       setSelectedProvider(cfg.provider);
       setBaseUrl(cfg.base_url);
       setModel(cfg.model);
+      setAllowLan(cfg.allow_lan_endpoints);
+      setSaveKeychain(cfg.save_key_to_keychain);
       setTemperature(String(cfg.temperature));
       setMaxTokens(String(cfg.max_tokens));
       setTimeoutSecs(String(cfg.timeout_secs));
@@ -135,6 +145,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
   };
 
   const handleSave = async () => {
+    if (readOnly) return;
     setSaving(true);
     setSavedFlag(false);
     setSaveError(null);
@@ -148,10 +159,14 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
         max_tokens: Number(maxTokens) || 1600,
         timeout_secs: Number(timeoutSecs) || 60,
         system_prompt: systemPrompt.trim() || undefined,
+        allow_lan_endpoints: allowLan,
+        save_key_to_keychain: saveKeychain,
       });
       setConfig(updated);
       setBaseUrl(updated.base_url);
       setModel(updated.model);
+      setAllowLan(updated.allow_lan_endpoints);
+      setSaveKeychain(updated.save_key_to_keychain);
       setApiKeyInput('');
       setSavedFlag(true);
       onConfigSaved();
@@ -163,6 +178,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
   };
 
   const handleClearKey = async () => {
+    if (readOnly) return;
     setSaving(true);
     setSaveError(null);
     try {
@@ -171,6 +187,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
         clear_api_key: true,
       });
       setConfig(updated);
+      setSaveKeychain(updated.save_key_to_keychain);
       setApiKeyInput('');
       onConfigSaved();
     } catch (err) {
@@ -307,6 +324,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
                   <TextInput
                     label="Base URL"
                     isLabelHidden
+                    type={opsecMode ? 'password' : 'text'}
                     value={baseUrl}
                     onChange={setBaseUrl}
                     placeholder={currentPreset?.default_base_url || 'http://127.0.0.1:11434'}
@@ -463,8 +481,84 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
                     width="100%"
                   />
                   <Text type="supporting" size="xsm" display="block" style={{ marginTop: 6 }}>
-                    Session-only storage: UI-entered keys stay in server RAM only and are never written to data/threat_store.json. Set {currentPreset?.env_var_name ?? 'CUSTOM_AI_API_KEY'} as a process environment variable to persist across restarts.
+                    Session-only by default: UI-entered keys stay in server RAM only and are never written to SQLite/disk. Opt in to OS Keychain below to securely persist credentials across restarts.
                   </Text>
+
+                  <div
+                    style={{
+                      marginTop: 10,
+                      padding: 10,
+                      border: '1px solid var(--soc-border)',
+                      background: 'var(--soc-surface)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 8,
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 8,
+                        fontSize: 12.5,
+                        cursor: readOnly || !config.keychain_available ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      <span>
+                        <input
+                          type="checkbox"
+                          checked={saveKeychain}
+                          disabled={readOnly || !config.keychain_available}
+                          onChange={(e) => setSaveKeychain(e.target.checked)}
+                          style={{ marginRight: 8 }}
+                        />
+                        Save API Key to OS Keychain (Credential Manager / macOS Keychain / Secret Service)
+                      </span>
+                      <Badge
+                        variant={
+                          !config.keychain_available
+                            ? 'warning'
+                            : config.keychain_has_key
+                              ? 'success'
+                              : 'info'
+                        }
+                        label={
+                          !config.keychain_available
+                            ? 'KEYCHAIN UNAVAILABLE'
+                            : config.keychain_has_key
+                              ? 'STORED IN KEYCHAIN'
+                              : 'KEYCHAIN READY'
+                        }
+                      />
+                    </label>
+
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 8,
+                        fontSize: 12.5,
+                        cursor: readOnly ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      <span>
+                        <input
+                          type="checkbox"
+                          checked={allowLan}
+                          disabled={readOnly}
+                          onChange={(e) => setAllowLan(e.target.checked)}
+                          style={{ marginRight: 8 }}
+                        />
+                        Allow Private LAN AI Endpoints (e.g. 192.168.x.x / 10.x Ollama or LM Studio)
+                      </span>
+                      <Badge
+                        variant={allowLan ? 'warning' : 'success'}
+                        label={allowLan ? 'LAN OPT-IN ON' : 'LOOPBACK + HTTPS ONLY'}
+                      />
+                    </label>
+                  </div>
                 </div>
               </>
             )}
@@ -514,6 +608,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
               </Text>
               <textarea
                 aria-label="SOC Analyst System Prompt"
+                disabled={readOnly}
                 value={systemPrompt}
                 onChange={(e) => setSystemPrompt(e.target.value)}
                 rows={3}
@@ -536,6 +631,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
                 variant="secondary"
                 icon={<Zap size={13} />}
                 isLoading={testing}
+                isDisabled={readOnly}
                 onClick={() => void handleTest()}
               />
               <Button
@@ -543,6 +639,7 @@ export function AiModelsView({ onConfigSaved }: AiModelsViewProps) {
                 variant="primary"
                 icon={<Save size={13} />}
                 isLoading={saving}
+                isDisabled={readOnly}
                 onClick={() => void handleSave()}
               />
               {savedFlag && (

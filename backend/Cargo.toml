@@ -1,6 +1,6 @@
 [package]
 name = "aibrainworx-threat-board"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "AiBrainWorX AI Cybersecurity Threat Analysis Board - Rust Backend"
 
@@ -8,7 +8,7 @@ description = "AiBrainWorX AI Cybersecurity Threat Analysis Board - Rust Backend
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +21,14 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = "8"
+mime_guess = "2"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+getrandom = "0.2"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+[dev-dependencies]
+http-body-util = "0.1"

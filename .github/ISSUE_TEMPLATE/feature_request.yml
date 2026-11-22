@@ -1,0 +1,12 @@
+name: Feature Request
+description: Suggest an improvement to AiBrainWorX Threat Board
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Proposed Feature
+      description: Describe the SOC workflow, security safeguard, or integration you need.
+    validations:
+      required: true

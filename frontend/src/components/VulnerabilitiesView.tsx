@@ -7,7 +7,7 @@ import { Spinner } from '@astryxdesign/core/Spinner';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
 import { Timestamp } from '@astryxdesign/core/Timestamp';
-import { Search, ShieldAlert } from 'lucide-react';
+import { Download, Search, ShieldAlert } from 'lucide-react';
 import { api, severityBadgeVariant } from '../api';
 import type { Vulnerability } from '../types';
 
@@ -22,6 +22,9 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
   const [aiOnly, setAiOnly] = useState(false);
   const [ransomwareOnly, setRansomwareOnly] = useState(false);
   const [exploitOnly, setExploitOnly] = useState(false);
+  const [stackOnly, setStackOnly] = useState(false);
+  const [epssSpikeOnly, setEpssSpikeOnly] = useState(false);
+  const [triageFilter, setTriageFilter] = useState('all');
   const [days, setDays] = useState('0');
   const [sort, setSort] = useState('ai_score');
   const [items, setItems] = useState<Vulnerability[]>([]);
@@ -39,6 +42,9 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
           ai_only: aiOnly,
           ransomware_only: ransomwareOnly,
           exploit_only: exploitOnly,
+          stack_only: stackOnly,
+          epss_spike: epssSpikeOnly,
+          triage: triageFilter,
           days: Number(days),
           sort,
           limit: 200,
@@ -50,7 +56,31 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
         .finally(() => setLoading(false));
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [query, severity, kevOnly, aiOnly, ransomwareOnly, exploitOnly, days, sort]);
+  }, [
+    query,
+    severity,
+    kevOnly,
+    aiOnly,
+    ransomwareOnly,
+    exploitOnly,
+    stackOnly,
+    epssSpikeOnly,
+    triageFilter,
+    days,
+    sort,
+  ]);
+
+  const activeParams = {
+    q: query,
+    severity,
+    kev_only: kevOnly,
+    ai_only: aiOnly,
+    ransomware_only: ransomwareOnly,
+    exploit_only: exploitOnly,
+    stack_only: stackOnly,
+    epss_spike: epssSpikeOnly,
+    triage: triageFilter,
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -60,12 +90,28 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
             <ShieldAlert size={14} color="#66efab" />
             Vulnerability Intelligence Explorer ({totalMatched} Matches)
           </span>
-          <SegmentedControl value={days} onChange={setDays} label="Timeframe" size="sm">
-            <SegmentedControlItem value="1" label="24h" />
-            <SegmentedControlItem value="7" label="Past 7d" />
-            <SegmentedControlItem value="30" label="30d" />
-            <SegmentedControlItem value="0" label="All Tracked" />
-          </SegmentedControl>
+          <div className="abw-flex-wrap" style={{ gap: 6 }}>
+            <Button
+              label="CSV"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => api.exportVulnerabilities('csv', activeParams)}
+            />
+            <Button
+              label="STIX 2.1"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => api.exportVulnerabilities('stix', activeParams)}
+            />
+            <SegmentedControl value={days} onChange={setDays} label="Timeframe" size="sm">
+              <SegmentedControlItem value="1" label="24h" />
+              <SegmentedControlItem value="7" label="Past 7d" />
+              <SegmentedControlItem value="30" label="30d" />
+              <SegmentedControlItem value="0" label="All Tracked" />
+            </SegmentedControl>
+          </div>
         </div>
         <div className="abw-panel-body">
           <Text type="supporting" size="xsm">
@@ -101,6 +147,20 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
 
             <select
               className="abw-select"
+              aria-label="Filter by triage status"
+              value={triageFilter}
+              onChange={(e) => setTriageFilter(e.target.value)}
+            >
+              <option value="all">All Triage States</option>
+              <option value="new">New</option>
+              <option value="investigating">Investigating</option>
+              <option value="mitigated">Mitigated</option>
+              <option value="false_positive">False Positive</option>
+              <option value="accepted">Risk Accepted</option>
+            </select>
+
+            <select
+              className="abw-select"
               aria-label="Sort order"
               value={sort}
               onChange={(e) => setSort(e.target.value)}
@@ -108,9 +168,22 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
               <option value="ai_score">Sort: AI Risk Score</option>
               <option value="cvss">Sort: CVSS Base</option>
               <option value="epss">Sort: FIRST EPSS %</option>
+              <option value="epss_delta">Sort: EPSS 24h Surge Δ</option>
               <option value="published">Sort: Newest Published</option>
             </select>
 
+            <Button
+              label="My Stack"
+              size="sm"
+              variant={stackOnly ? 'primary' : 'secondary'}
+              onClick={() => setStackOnly((v) => !v)}
+            />
+            <Button
+              label="EPSS Spike"
+              size="sm"
+              variant={epssSpikeOnly ? 'primary' : 'secondary'}
+              onClick={() => setEpssSpikeOnly((v) => !v)}
+            />
             <Button
               label="CISA KEV"
               size="sm"
@@ -163,6 +236,9 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
                     setAiOnly(false);
                     setRansomwareOnly(false);
                     setExploitOnly(false);
+                    setStackOnly(false);
+                    setEpssSpikeOnly(false);
+                    setTriageFilter('all');
                     setDays('0');
                   }}
                 />
@@ -214,6 +290,12 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
                   </td>
                   <td className="abw-mono">
                     {v.epss_score != null ? `${(v.epss_score * 100).toFixed(1)}%` : '—'}
+                    {v.epss_delta_24h != null && Math.abs(v.epss_delta_24h) >= 0.01 && (
+                      <div style={{ fontSize: 10, color: v.epss_spike ? '#f97316' : 'var(--soc-text-muted)' }}>
+                        {v.epss_delta_24h > 0 ? '+' : ''}
+                        {(v.epss_delta_24h * 100).toFixed(1)}% Δ
+                      </div>
+                    )}
                   </td>
                   <td>
                     <Text weight="medium" size="sm" display="block">
@@ -230,7 +312,17 @@ export function VulnerabilitiesView({ onSelectVuln }: VulnerabilitiesViewProps) 
                       {v.title}
                     </Text>
                     <div className="abw-flex-wrap" style={{ marginTop: 4 }}>
+                      {v.matched_stack && v.matched_stack.length > 0 && (
+                        <Badge variant="warning" label={`STACK: ${v.matched_stack[0]}`} />
+                      )}
                       {v.is_kev && <Badge variant="error" label="CISA KEV" />}
+                      {v.kev_days_remaining != null && v.kev_days_remaining < 0 && (
+                        <Badge variant="error" label={`OVERDUE ${Math.abs(v.kev_days_remaining)}d`} />
+                      )}
+                      {v.epss_spike && <Badge variant="orange" label="EPSS SURGE" />}
+                      {v.triage_status && v.triage_status !== 'new' && (
+                        <Badge variant="info" label={v.triage_status.toUpperCase()} />
+                      )}
                       {v.ransomware_use && <Badge variant="purple" label="Ransomware" />}
                       {v.has_public_exploit && <Badge variant="orange" label="Exploit PoC" />}
                       {v.is_ai_related && <Badge variant="cyan" label="AI/ML" />}

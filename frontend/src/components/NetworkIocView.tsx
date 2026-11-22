@@ -3,19 +3,33 @@ import { Badge } from '@astryxdesign/core/Badge';
 import { Button } from '@astryxdesign/core/Button';
 import { Text } from '@astryxdesign/core/Text';
 import { TextInput } from '@astryxdesign/core/TextInput';
-import { Globe, Search } from 'lucide-react';
+import { Copy, Download, EyeOff, Globe, Search, ShieldAlert } from 'lucide-react';
 import { api } from '../api';
-import type { IocLookupResult, NetworkTelemetry } from '../types';
+import type { BulkIocResponse, IocLookupResult, NetworkTelemetry } from '../types';
+import {
+  defangIp,
+  defangUrl,
+  redactDisplayText,
+  redactHostname,
+  redactIp,
+  redactUrl,
+} from '../utils/opsec';
 
 interface NetworkIocViewProps {
   telemetry: NetworkTelemetry;
+  opsecMode: boolean;
   onSelectVulnId: (id: string) => void;
 }
 
-export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProps) {
+export function NetworkIocView({ telemetry, opsecMode, onSelectVulnId }: NetworkIocViewProps) {
   const [iocQuery, setIocQuery] = useState('');
   const [lookupResult, setLookupResult] = useState<IocLookupResult | null>(null);
   const [checking, setChecking] = useState(false);
+
+  const [bulkInput, setBulkInput] = useState('');
+  const [bulkResult, setBulkResult] = useState<BulkIocResponse | null>(null);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [copiedMsg, setCopiedMsg] = useState<string | null>(null);
 
   const runLookup = async (override?: string) => {
     const q = (override ?? iocQuery).trim();
@@ -29,19 +43,88 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
     }
   };
 
+  const runBulkLookup = async () => {
+    const lines = bulkInput
+      .split(/[\r\n,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+    setBulkLoading(true);
+    try {
+      const res = await api.bulkLookupIocs(lines);
+      setBulkResult(res);
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  const copyDefangedMatches = async () => {
+    if (!bulkResult) return;
+    const hits = bulkResult.results
+      .filter((r) => r.matched)
+      .map((r) => (r.query.includes('://') ? defangUrl(r.query) : defangIp(r.query)));
+    if (hits.length === 0) return;
+    await navigator.clipboard.writeText(hits.join('\n')).catch(() => {});
+    setCopiedMsg(`Copied ${hits.length} defanged hits`);
+    setTimeout(() => setCopiedMsg(null), 2500);
+  };
+
+  const displayIp = (ip: string) => (opsecMode ? redactIp(ip) : ip);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      {/* Instant IOC Verifier */}
+      {opsecMode && (
+        <div className="abw-alert-bar" style={{ borderLeftColor: '#66efab', background: 'var(--soc-mint-soft)' }}>
+          <div className="abw-flex-wrap">
+            <EyeOff size={15} color="#66efab" />
+            <Text size="sm" weight="semibold">
+              OPSEC Redact Mode Active: Public attacker IPs, C2 endpoints, and phishing domains are masked for safe screen sharing.
+            </Text>
+          </div>
+        </div>
+      )}
+
+      {/* Firewall Blocklist Exports + Instant IOC Verifier */}
       <section className="abw-panel">
         <div className="abw-panel-head">
           <span className="abw-panel-title">
             <Globe size={14} color="#66efab" />
-            Live IOC Reputation & Threat Sensor Lookup
+            Live IOC Reputation & Firewall Blocklist Exports
           </span>
+          <div className="abw-flex-wrap" style={{ gap: 6 }}>
+            <Button
+              label="EDL (.txt)"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => void api.exportIocs('edl')}
+            />
+            <Button
+              label="nftables"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => void api.exportIocs('nftables')}
+            />
+            <Button
+              label="pf Table"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => void api.exportIocs('pf')}
+            />
+            <Button
+              label="CSV"
+              size="sm"
+              variant="secondary"
+              icon={<Download size={12} />}
+              onClick={() => void api.exportIocs('csv')}
+            />
+          </div>
         </div>
         <div className="abw-panel-body">
           <Text type="supporting" size="sm">
-            Check any IPv4 address, hostname, or domain instantly against SANS ISC Top Attackers, abuse.ch Feodo Botnet C2s, OpenPhish, and Emerging Threats Compromised IPs ({telemetry.compromised_ips_total_count.toLocaleString()} hosts).
+            Check any IPv4 address, hostname, defanged IOC, or domain against SANS ISC Top Attackers, abuse.ch Feodo Botnet C2s, OpenPhish, and Emerging Threats Compromised IPs ({telemetry.compromised_ips_total_count.toLocaleString()} hosts).
           </Text>
 
           <div className="abw-flex-wrap" style={{ gap: 8 }}>
@@ -52,7 +135,7 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
                 value={iocQuery}
                 onChange={setIocQuery}
                 onEnter={() => void runLookup()}
-                placeholder="Enter IP (e.g. 66.240.205.34) or phishing domain..."
+                placeholder="Enter IP (e.g. 198.51.100.14 or 198.51.100[.]14) or domain..."
                 startIcon={<Search size={14} />}
                 hasClear
                 width="100%"
@@ -66,12 +149,12 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
             />
             {telemetry.top_attacking_ips[0] && (
               <Button
-                label={`Test IP (${telemetry.top_attacking_ips[0].ip})`}
+                label={`Sample Top Attacker (${displayIp(telemetry.top_attacking_ips[0].ip)})`}
                 variant="secondary"
                 size="sm"
                 onClick={() => {
                   const sample = telemetry.top_attacking_ips[0].ip;
-                  setIocQuery(sample);
+                  setIocQuery(opsecMode ? redactIp(sample) : sample);
                   void runLookup(sample);
                 }}
               />
@@ -93,16 +176,112 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
             >
               <div>
                 <div className="abw-mono" style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 3 }}>
-                  {lookupResult.query} — {lookupResult.risk_verdict}
+                  {redactDisplayText(lookupResult.query, opsecMode)} — {lookupResult.risk_verdict}
                 </div>
                 <Text type="supporting" size="xsm">
                   {lookupResult.matched
-                    ? lookupResult.hits
-                        .map((h) => `[${h.feed}] ${h.indicator_type}: ${h.detail}`)
-                        .join(' | ')
+                    ? redactDisplayText(
+                        lookupResult.hits
+                          .map((h) => `[${h.feed}] ${h.indicator_type}: ${h.detail}`)
+                          .join(' | '),
+                        opsecMode
+                      )
                     : 'Indicator not present in active public blocklists or C2 sensors.'}
                 </Text>
               </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* Bulk Batch IOC Lookup */}
+      <section className="abw-panel">
+        <div className="abw-panel-head">
+          <span className="abw-panel-title">
+            <ShieldAlert size={14} color="#38bdf8" />
+            Bulk IOC Triage (Up to 200 IPs / Domains / Defanged URLs)
+          </span>
+          <div className="abw-flex-wrap" style={{ gap: 6 }}>
+            {bulkResult && bulkResult.matched_count > 0 && (
+              <Button
+                label={copiedMsg ?? 'Copy Defanged Hits'}
+                size="sm"
+                variant="secondary"
+                icon={<Copy size={12} />}
+                onClick={() => void copyDefangedMatches()}
+              />
+            )}
+            <Button
+              label={bulkLoading ? 'Checking...' : 'Check Batch'}
+              size="sm"
+              variant="primary"
+              isLoading={bulkLoading}
+              onClick={() => void runBulkLookup()}
+            />
+          </div>
+        </div>
+        <div className="abw-panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <textarea
+            rows={3}
+            value={bulkInput}
+            onChange={(e) => setBulkInput(e.target.value)}
+            placeholder="Paste firewall log IPs, domains, or defanged URLs (one per line or comma-separated)..."
+            style={{
+              width: '100%',
+              background: 'var(--soc-surface)',
+              border: '1px solid var(--soc-border)',
+              color: 'var(--soc-text)',
+              padding: 8,
+              fontFamily: 'ui-monospace, monospace',
+              fontSize: 12,
+            }}
+          />
+          {bulkResult && (
+            <div>
+              <div className="abw-flex-wrap" style={{ marginBottom: 8 }}>
+                <Badge variant="info" label={`Checked ${bulkResult.checked}`} />
+                <Badge
+                  variant={bulkResult.matched_count > 0 ? 'error' : 'success'}
+                  label={`${bulkResult.matched_count} Malicious Hits`}
+                />
+              </div>
+              {bulkResult.results.filter((r) => r.matched).length > 0 && (
+                <div className="abw-table-wrap" style={{ maxHeight: 200, overflowY: 'auto' }}>
+                  <table className="abw-table">
+                    <thead>
+                      <tr>
+                        <th>Indicator (Defanged)</th>
+                        <th>Verdict</th>
+                        <th>Sensor Matches</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bulkResult.results
+                        .filter((r) => r.matched)
+                        .map((r) => (
+                          <tr key={r.query}>
+                            <td className="abw-mono">
+                              {opsecMode
+                                ? redactDisplayText(r.query, true)
+                                : r.query.includes('://')
+                                  ? defangUrl(r.query)
+                                  : defangIp(r.query)}
+                            </td>
+                            <td>
+                              <Badge variant="error" label="FLAGGED" />
+                            </td>
+                            <td style={{ fontSize: 12 }}>
+                              {redactDisplayText(
+                                r.hits.map((h) => `[${h.feed}] ${h.detail}`).join('; '),
+                                opsecMode
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -131,7 +310,7 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
                 {telemetry.botnet_c2s.slice(0, 40).map((c2) => (
                   <tr key={`${c2.ip_address}:${c2.port}`}>
                     <td className="abw-mono">
-                      {c2.ip_address}:{c2.port}
+                      {displayIp(c2.ip_address)}:{c2.port}
                     </td>
                     <td>
                       <Badge variant="purple" label={c2.malware} />
@@ -177,11 +356,11 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
                     key={ip.ip}
                     className="clickable"
                     onClick={() => {
-                      setIocQuery(ip.ip);
+                      setIocQuery(opsecMode ? redactIp(ip.ip) : ip.ip);
                       void runLookup(ip.ip);
                     }}
                   >
-                    <td className="abw-mono">{ip.ip}</td>
+                    <td className="abw-mono">{displayIp(ip.ip)}</td>
                     <td className="abw-mono">{ip.attacks.toLocaleString()}</td>
                     <td className="abw-mono">{ip.count.toLocaleString()}</td>
                     <td className="abw-mono">{ip.last_seen}</td>
@@ -193,24 +372,32 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
         </section>
       </div>
 
-      {/* Bottom Row: OpenPhish + FIRST Global High EPSS */}
+      {/* Bottom Row: OpenPhish (Defanged, Non-Clickable) + FIRST Global High EPSS */}
       <div className="abw-grid-2">
         <section className="abw-panel">
           <div className="abw-panel-head">
-            <span className="abw-panel-title">OpenPhish Live Phishing Campaigns</span>
+            <span className="abw-panel-title">OpenPhish Live Phishing Campaigns (Defanged)</span>
             <Badge variant="warning" label={`${telemetry.phishing_total_count} ACTIVE URLS`} />
           </div>
           <div className="abw-scroll-list" style={{ maxHeight: 320 }}>
             {telemetry.phishing_urls.slice(0, 35).map((p, idx) => (
               <div key={idx} className="abw-list-row">
-                <div className="abw-flex-wrap">
-                  <strong className="abw-mono" style={{ fontSize: 12 }}>
-                    {p.domain}
-                  </strong>
-                  {p.suspected_brand && <Badge variant="orange" label={p.suspected_brand} />}
+                <div className="abw-flex-wrap" style={{ justifyContent: 'space-between' }}>
+                  <div className="abw-flex-wrap">
+                    <strong className="abw-mono" style={{ fontSize: 12 }}>
+                      {opsecMode ? redactHostname(p.domain) : defangIp(p.domain)}
+                    </strong>
+                    {p.suspected_brand && <Badge variant="orange" label={p.suspected_brand} />}
+                  </div>
+                  <Button
+                    label="Copy"
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void navigator.clipboard.writeText(defangUrl(p.url)).catch(() => {})}
+                  />
                 </div>
                 <Text type="code" size="xsm" color="secondary" maxLines={1}>
-                  {p.url}
+                  {opsecMode ? redactUrl(p.url, true) : defangUrl(p.url)}
                 </Text>
               </div>
             ))}
@@ -254,7 +441,8 @@ export function NetworkIocView({ telemetry, onSelectVulnId }: NetworkIocViewProp
           </div>
           <div style={{ padding: '10px 14px', borderTop: '1px solid var(--soc-border)' }}>
             <Text type="supporting" size="xsm" display="block">
-              Emerging Threats Blocklist: <strong>{telemetry.compromised_ips_total_count.toLocaleString()}</strong> compromised IPv4 addresses indexed locally for zero-latency IOC matching.
+              Emerging Threats Blocklist:{' '}
+              <strong>{telemetry.compromised_ips_total_count.toLocaleString()}</strong> compromised IPv4 addresses indexed locally for zero-latency IOC matching.
             </Text>
           </div>
         </section>

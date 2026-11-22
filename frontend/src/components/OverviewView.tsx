@@ -12,9 +12,11 @@ import {
   ExternalLink,
   Flame,
   Globe,
+  Layers,
   Newspaper,
   ShieldAlert,
   Sparkles,
+  TrendingUp,
 } from 'lucide-react';
 import {
   Area,
@@ -31,14 +33,18 @@ import {
   YAxis,
   ZAxis,
 } from 'recharts';
-import { safeExternalUrl, severityBadgeVariant } from '../api';
+import { api, safeExternalUrl, severityBadgeVariant } from '../api';
 import type { DashboardPayload, NavTab, ThreatAlert, Vulnerability } from '../types';
+import { redactDisplayText, sanitizeMarkdownClient } from '../utils/opsec';
 
 interface OverviewViewProps {
   data: DashboardPayload;
+  opsecMode: boolean;
+  readOnly: boolean;
   onSelectVuln: (v: Vulnerability) => void;
   onSelectVulnId: (id: string) => void;
   onAckAlert: (id: string) => void;
+  onDeltaReviewed: () => void;
   onNavigate: (tab: NavTab) => void;
 }
 
@@ -59,12 +65,25 @@ const CHART_TOOLTIP_STYLE = {
 
 export function OverviewView({
   data,
+  opsecMode,
+  readOnly,
   onSelectVuln,
   onSelectVulnId,
   onAckAlert,
+  onDeltaReviewed,
   onNavigate,
 }: OverviewViewProps) {
-  const { ai_brief: brief, kpis, top_vulnerabilities, recent_news, telemetry, alerts } = data;
+  const {
+    ai_brief: brief,
+    kpis,
+    top_vulnerabilities,
+    recent_news,
+    telemetry,
+    alerts,
+    stack_summary,
+    recent_epss_spikes,
+    latest_delta,
+  } = data;
   const activeAlert: ThreatAlert | undefined = alerts.find((a) => !a.acknowledged);
 
   const scatterData = top_vulnerabilities
@@ -103,10 +122,10 @@ export function OverviewView({
             <div style={{ minWidth: 0 }}>
               <div className="abw-flex-wrap" style={{ marginBottom: 3 }}>
                 <Badge variant={severityBadgeVariant(activeAlert.severity)} label={activeAlert.severity} />
-                <strong style={{ fontSize: 13 }}>{activeAlert.title}</strong>
+                <strong style={{ fontSize: 13 }}>{redactDisplayText(activeAlert.title, opsecMode)}</strong>
               </div>
               <Text type="supporting" size="xsm" display="block">
-                {activeAlert.summary} ({activeAlert.matched_reasons.join(' · ')})
+                {redactDisplayText(activeAlert.summary, opsecMode)} ({activeAlert.matched_reasons.join(' · ')})
               </Text>
             </div>
           </div>
@@ -124,10 +143,112 @@ export function OverviewView({
               size="sm"
               variant="secondary"
               icon={<Check size={13} />}
+              isDisabled={readOnly}
               onClick={() => onAckAlert(activeAlert.id)}
             />
           </div>
         </div>
+      )}
+
+      {/* Exposed in Your Stack Banner */}
+      {stack_summary?.configured && stack_summary.matched_vuln_count > 0 && (
+        <div
+          className="abw-alert-bar"
+          style={{
+            borderColor: 'rgba(249, 115, 22, 0.55)',
+            borderLeftColor: '#f97316',
+            background: 'rgba(249, 115, 22, 0.08)',
+          }}
+        >
+          <div className="abw-alert-bar-body">
+            <Layers size={16} color="#f97316" style={{ marginTop: 2, flexShrink: 0 }} />
+            <div style={{ minWidth: 0 }}>
+              <div className="abw-flex-wrap" style={{ marginBottom: 4 }}>
+                <Badge variant="orange" label="MY STACK EXPOSURE" />
+                <strong style={{ fontSize: 13 }}>
+                  {stack_summary.matched_vuln_count} tracked CVEs ({stack_summary.matched_kev_count} CISA KEV) match your local SBOM / watchlist
+                </strong>
+              </div>
+              <div className="abw-flex-wrap" style={{ gap: 6 }}>
+                {stack_summary.top_matched_cves.slice(0, 6).map((cve) => (
+                  <button
+                    key={cve}
+                    type="button"
+                    className="abw-cve-chip"
+                    onClick={() => onSelectVulnId(cve)}
+                  >
+                    {cve}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <Button
+            label="Open My Stack"
+            size="sm"
+            variant="secondary"
+            onClick={() => onNavigate('mystack')}
+          />
+        </div>
+      )}
+
+      {/* What Changed Since Last Sync & EPSS 24h Surges */}
+      {(recent_epss_spikes.length > 0 || (latest_delta && !latest_delta.reviewed)) && (
+        <section className="abw-panel">
+          <div className="abw-panel-head">
+            <span className="abw-panel-title">
+              <TrendingUp size={14} color="#f97316" />
+              What Changed & Exploit Velocity Spikes
+            </span>
+            <div className="abw-flex-wrap" style={{ gap: 6 }}>
+              {latest_delta && (
+                <Badge
+                  variant={latest_delta.reviewed ? 'neutral' : 'warning'}
+                  label={
+                    latest_delta.reviewed
+                      ? 'Delta Reviewed'
+                      : `${latest_delta.new_cves.length} New · ${latest_delta.new_kevs.length} KEV · ${latest_delta.epss_spikes.length} Spikes`
+                  }
+                />
+              )}
+              {latest_delta && !latest_delta.reviewed && (
+                <Button
+                  label="Mark Reviewed"
+                  size="sm"
+                  variant="secondary"
+                  icon={<Check size={12} />}
+                  isDisabled={readOnly}
+                  onClick={() => void api.ackDelta().then(onDeltaReviewed)}
+                />
+              )}
+            </div>
+          </div>
+          <div className="abw-panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {recent_epss_spikes.length > 0 ? (
+              <div className="abw-flex-wrap" style={{ gap: 6 }}>
+                {recent_epss_spikes.slice(0, 6).map((spike) => (
+                  <button
+                    key={spike.cve_id}
+                    type="button"
+                    className="abw-cve-chip"
+                    style={{ borderColor: 'rgba(249, 115, 22, 0.5)' }}
+                    onClick={() => onSelectVulnId(spike.cve_id)}
+                  >
+                    <strong>{spike.cve_id}</strong> · {spike.current_epss_pct.toFixed(1)}% (+
+                    {spike.delta_24h_pct.toFixed(1)}% 24h)
+                    {spike.matched_stack.length > 0 ? ` [${spike.matched_stack[0]}]` : ''}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <Text type="supporting" size="xsm">
+                Latest sweep captured {latest_delta?.new_cves.length ?? 0} new CVEs,{' '}
+                {latest_delta?.new_stack_hits.length ?? 0} My Stack matches, and{' '}
+                {latest_delta?.new_alerts_count ?? 0} new watchlist alerts.
+              </Text>
+            )}
+          </div>
+        </section>
       )}
 
       {/* Unified 6-Column Seamless KPI Strip */}
@@ -221,7 +342,9 @@ export function OverviewView({
             />
           </div>
           <div className="abw-panel-body">
-            <Markdown density="compact">{brief.executive_summary}</Markdown>
+            <Markdown density="compact">
+              {sanitizeMarkdownClient(redactDisplayText(brief.executive_summary, opsecMode))}
+            </Markdown>
 
             {brief.key_findings.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>

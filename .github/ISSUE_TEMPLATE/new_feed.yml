@@ -1,0 +1,29 @@
+name: Suggest Public Threat Feed
+description: Request a new unauthenticated, free, high-signal CTI feed
+title: "[Feed]: "
+labels: ["enhancement", "threat-intel"]
+body:
+  - type: input
+    id: feed_url
+    attributes:
+      label: HTTPS Feed URL
+      placeholder: "https://..."
+    validations:
+      required: true
+  - type: dropdown
+    id: feed_format
+    attributes:
+      label: Feed Format
+      options:
+        - RSS / Atom
+        - Plaintext IP / URL IOC List
+        - STIX 2.1 Bundle
+        - MISP JSON
+        - JSON API
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Authentication & Licensing Notes
+      description: Built-in feeds must require zero paid API keys and allow redistribution/local aggregation.

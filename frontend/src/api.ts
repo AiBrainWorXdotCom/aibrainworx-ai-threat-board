@@ -6,17 +6,37 @@ import type {
   AiQueryResponse,
   AiTestResponse,
   AlertRules,
+  AuthStatusResponse,
+  BulkIocResponse,
+  CustomFeedConfig,
+  CustomFeedCreateRequest,
+  CveTriage,
   DashboardPayload,
   FeedHealth,
+  FeedSettings,
   IocLookupResult,
+  MyStackPayload,
+  MyStackUpdateRequest,
   NetworkTelemetry,
+  SnapshotImportResult,
+  StackImportResponse,
   ThreatAlert,
   ThreatNewsItem,
+  TriageStatus,
   Vulnerability,
+  WebhookCreateRequest,
+  WebhookTargetPublic,
+  WebhookTestResponse,
+  WebhookUpdateRequest,
 } from './types';
+import { demoApi } from './demoData';
+import { downloadTextFile } from './utils/opsec';
+
+export const IS_DEMO_MODE = import.meta.env.VITE_DEMO_MODE === '1';
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
+    credentials: 'same-origin',
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -30,10 +50,43 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export const api = {
-  getDashboard: () => fetchJson<DashboardPayload>('/api/dashboard'),
+async function downloadEndpointFile(url: string, fallbackFilename: string): Promise<void> {
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Export ${res.status}: ${txt || res.statusText}`);
+  }
+  const cd = res.headers.get('content-disposition') || '';
+  const match = cd.match(/filename="?([^"]+)"?/i);
+  const filename = match?.[1] || fallbackFilename;
+  const text = await res.text();
+  downloadTextFile(filename, text, res.headers.get('content-type') || 'text/plain;charset=utf-8');
+}
 
-  getVulnerabilities: (params: Record<string, string | number | boolean | undefined>) => {
+export const api = {
+  getAuthStatus: async (): Promise<AuthStatusResponse> =>
+    IS_DEMO_MODE ? demoApi.getAuthStatus() : fetchJson<AuthStatusResponse>('/api/auth/status'),
+
+  login: async (token: string): Promise<{ authenticated: boolean }> => {
+    if (IS_DEMO_MODE) return { authenticated: true };
+    return fetchJson<{ authenticated: boolean }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+  },
+
+  logout: async (): Promise<{ authenticated: boolean }> => {
+    if (IS_DEMO_MODE) return { authenticated: false };
+    return fetchJson<{ authenticated: boolean }>('/api/auth/logout', { method: 'POST' });
+  },
+
+  getDashboard: async (): Promise<DashboardPayload> =>
+    IS_DEMO_MODE ? demoApi.getDashboard() : fetchJson<DashboardPayload>('/api/dashboard'),
+
+  getVulnerabilities: async (
+    params: Record<string, string | number | boolean | undefined>
+  ): Promise<{ total_matched: number; items: Vulnerability[] }> => {
+    if (IS_DEMO_MODE) return demoApi.getVulnerabilities(params);
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== '' && v !== false) {
@@ -45,12 +98,112 @@ export const api = {
     );
   },
 
-  getVulnerabilityDetail: (id: string) =>
-    fetchJson<{ vulnerability: Vulnerability; related_news: ThreatNewsItem[] }>(
-      `/api/vulnerabilities/${encodeURIComponent(id)}`
-    ),
+  getVulnerabilityDetail: async (
+    id: string
+  ): Promise<{ vulnerability: Vulnerability; related_news: ThreatNewsItem[] }> =>
+    IS_DEMO_MODE
+      ? demoApi.getVulnerabilityDetail(id)
+      : fetchJson<{ vulnerability: Vulnerability; related_news: ThreatNewsItem[] }>(
+          `/api/vulnerabilities/${encodeURIComponent(id)}`
+        ),
 
-  getNews: (params: Record<string, string | number | boolean | undefined>) => {
+  updateVulnTriage: async (
+    id: string,
+    status: TriageStatus,
+    notes: string
+  ): Promise<CveTriage> =>
+    IS_DEMO_MODE
+      ? demoApi.updateVulnTriage(id, status, notes)
+      : fetchJson<CveTriage>(`/api/vulnerabilities/${encodeURIComponent(id)}/triage`, {
+          method: 'PUT',
+          body: JSON.stringify({ status, notes }),
+        }),
+
+  exportSingleVuln: async (id: string, format: 'markdown' | 'json' | 'stix') => {
+    if (IS_DEMO_MODE) {
+      const { vulnerability } = await demoApi.getVulnerabilityDetail(id);
+      const ext = format === 'markdown' ? 'md' : format === 'stix' ? 'stix21.json' : 'json';
+      const content =
+        format === 'markdown'
+          ? `# ${vulnerability.id} - ${vulnerability.title}\n\n- **Severity:** ${vulnerability.severity}\n- **AI Risk Score:** ${vulnerability.ai_risk_score}/100\n\n## Description\n\n${vulnerability.description}\n`
+          : JSON.stringify(vulnerability, null, 2);
+      downloadTextFile(`${vulnerability.id}.${ext}`, content);
+      return;
+    }
+    return downloadEndpointFile(
+      `/api/vulnerabilities/${encodeURIComponent(id)}/export?format=${format}`,
+      `${id}.${format === 'markdown' ? 'md' : 'json'}`
+    );
+  },
+
+  exportVulnerabilities: async (
+    format: 'csv' | 'json' | 'stix',
+    params: Record<string, string | number | boolean | undefined>
+  ) => {
+    if (IS_DEMO_MODE) {
+      const { items } = await demoApi.getVulnerabilities(params);
+      if (format === 'csv') {
+        const lines = ['cve_id,severity,ai_risk_score,cvss_score,epss_pct,is_kev,title'];
+        items.forEach((v) =>
+          lines.push(
+            `"${v.id}","${v.severity}",${v.ai_risk_score},${v.cvss_score ?? ''},${((v.epss_score ?? 0) * 100).toFixed(2)},${v.is_kev},"${v.title.replace(/"/g, '""')}"`
+          )
+        );
+        downloadTextFile('aibrainworx-demo-vulnerabilities.csv', lines.join('\n'), 'text/csv');
+      } else {
+        downloadTextFile(
+          `aibrainworx-demo-${format}.json`,
+          JSON.stringify(items, null, 2),
+          'application/json'
+        );
+      }
+      return;
+    }
+    const qs = new URLSearchParams({ format });
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== '' && v !== false) {
+        qs.set(k, String(v));
+      }
+    });
+    return downloadEndpointFile(
+      `/api/export/vulnerabilities?${qs.toString()}`,
+      `aibrainworx-vulnerabilities.${format}`
+    );
+  },
+
+  getStack: async (): Promise<MyStackPayload> =>
+    IS_DEMO_MODE ? demoApi.getStack() : fetchJson<MyStackPayload>('/api/stack'),
+
+  updateStack: async (req: MyStackUpdateRequest): Promise<MyStackPayload> =>
+    IS_DEMO_MODE
+      ? demoApi.updateStack(req)
+      : fetchJson<MyStackPayload>('/api/stack', {
+          method: 'PUT',
+          body: JSON.stringify(req),
+        }),
+
+  importStack: async (
+    filename: string,
+    content: string,
+    replace = true
+  ): Promise<StackImportResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.importStack(filename, content, replace)
+      : fetchJson<StackImportResponse>('/api/stack/import', {
+          method: 'POST',
+          body: JSON.stringify({ filename, content, replace }),
+        }),
+
+  clearStack: async (): Promise<MyStackPayload> =>
+    IS_DEMO_MODE
+      ? demoApi.clearStack()
+      : fetchJson<MyStackPayload>('/api/stack', { method: 'DELETE' }),
+
+  getNews: async (params: Record<string, string | number | boolean | undefined>) => {
+    if (IS_DEMO_MODE) {
+      const dash = await demoApi.getDashboard();
+      return { total_matched: dash.recent_news.length, sources: [], items: dash.recent_news };
+    }
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== '' && v !== false) {
@@ -62,57 +215,213 @@ export const api = {
     );
   },
 
-  getIocs: (lookup?: string) => {
+  getIocs: async (lookup?: string) => {
+    if (IS_DEMO_MODE) {
+      const dash = await demoApi.getDashboard();
+      return {
+        telemetry: dash.telemetry as NetworkTelemetry,
+        lookup_result: lookup ? demoApi.lookupSingleIoc(lookup) : null,
+      };
+    }
     const qs = lookup ? `?lookup=${encodeURIComponent(lookup)}` : '';
     return fetchJson<{ telemetry: NetworkTelemetry; lookup_result: IocLookupResult | null }>(
       `/api/iocs${qs}`
     );
   },
 
-  getAlerts: () =>
-    fetchJson<{ unacknowledged_count: number; alerts: ThreatAlert[] }>('/api/alerts'),
+  bulkLookupIocs: async (indicators: string[]): Promise<BulkIocResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.bulkLookupIocs(indicators)
+      : fetchJson<BulkIocResponse>('/api/iocs/bulk', {
+          method: 'POST',
+          body: JSON.stringify({ indicators }),
+        }),
 
-  ackAlert: (id: string) =>
-    fetchJson<{ ok: boolean }>(`/api/alerts/${encodeURIComponent(id)}/ack`, { method: 'POST' }),
+  exportIocs: async (format: 'edl' | 'nftables' | 'pf' | 'csv') => {
+    if (IS_DEMO_MODE) {
+      const { telemetry } = await demoApi.getDashboard();
+      const ips = Array.from(
+        new Set([
+          ...telemetry.botnet_c2s.map((c) => c.ip_address),
+          ...telemetry.top_attacking_ips.map((i) => i.ip),
+        ])
+      );
+      if (format === 'nftables') {
+        downloadTextFile(
+          'aibrainworx-demo-nftables.nft',
+          `set aibrainworx_blocklist {\n  type ipv4_addr\n  elements = { ${ips.join(', ')} }\n}\n`
+        );
+      } else {
+        downloadTextFile(`aibrainworx-demo-iocs.${format === 'csv' ? 'csv' : 'txt'}`, ips.join('\n'));
+      }
+      return;
+    }
+    return downloadEndpointFile(`/api/iocs/export?format=${format}`, `aibrainworx-iocs.${format}`);
+  },
 
-  ackAllAlerts: () =>
-    fetchJson<{ ok: boolean }>('/api/alerts/ack-all', { method: 'POST' }),
+  getAlerts: async () => {
+    if (IS_DEMO_MODE) {
+      const d = await demoApi.getDashboard();
+      return { unacknowledged_count: d.kpis.unacknowledged_alerts, alerts: d.alerts };
+    }
+    return fetchJson<{ unacknowledged_count: number; alerts: ThreatAlert[] }>('/api/alerts');
+  },
 
-  triggerTestAlert: () =>
-    fetchJson<ThreatAlert>('/api/alerts/test', { method: 'POST' }),
+  ackAlert: async (id: string) =>
+    IS_DEMO_MODE
+      ? demoApi.ackAlert(id)
+      : fetchJson<{ ok: boolean }>(`/api/alerts/${encodeURIComponent(id)}/ack`, { method: 'POST' }),
 
-  getFeeds: () =>
-    fetchJson<{
-      last_sweep_at: string | null;
-      next_sweep_at: string | null;
-      sweep_in_progress: boolean;
-      feeds: FeedHealth[];
-    }>('/api/feeds'),
+  ackAllAlerts: async () =>
+    IS_DEMO_MODE
+      ? demoApi.ackAllAlerts()
+      : fetchJson<{ ok: boolean }>('/api/alerts/ack-all', { method: 'POST' }),
 
-  triggerRefresh: () =>
-    fetchJson<{ status: string }>('/api/refresh', { method: 'POST' }),
+  triggerTestAlert: async (): Promise<ThreatAlert> =>
+    IS_DEMO_MODE
+      ? demoApi.triggerTestAlert()
+      : fetchJson<ThreatAlert>('/api/alerts/test', { method: 'POST' }),
 
-  getRules: () => fetchJson<AlertRules>('/api/rules'),
+  getFeeds: async (): Promise<{
+    last_sweep_at: string | null;
+    next_sweep_at: string | null;
+    sweep_in_progress: boolean;
+    feeds: FeedHealth[];
+    feed_settings?: FeedSettings;
+  }> => (IS_DEMO_MODE ? demoApi.getFeeds() : fetchJson('/api/feeds')),
+
+  updateFeedConfig: async (feed_name: string, enabled: boolean): Promise<FeedSettings> =>
+    IS_DEMO_MODE
+      ? demoApi.updateFeedConfig(feed_name, enabled)
+      : fetchJson<FeedSettings>('/api/feeds/config', {
+          method: 'PUT',
+          body: JSON.stringify({ feed_name, enabled }),
+        }),
+
+  createCustomFeed: async (req: CustomFeedCreateRequest): Promise<CustomFeedConfig> =>
+    IS_DEMO_MODE
+      ? demoApi.createCustomFeed(req)
+      : fetchJson<CustomFeedConfig>('/api/feeds/custom', {
+          method: 'POST',
+          body: JSON.stringify(req),
+        }),
+
+  deleteCustomFeed: async (id: string): Promise<{ ok: boolean }> =>
+    IS_DEMO_MODE
+      ? demoApi.deleteCustomFeed(id)
+      : fetchJson<{ ok: boolean }>(`/api/feeds/custom/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        }),
+
+  listWebhooks: async (): Promise<WebhookTargetPublic[]> =>
+    IS_DEMO_MODE ? demoApi.listWebhooks() : fetchJson<WebhookTargetPublic[]>('/api/webhooks'),
+
+  createWebhook: async (req: WebhookCreateRequest): Promise<WebhookTargetPublic> =>
+    IS_DEMO_MODE
+      ? demoApi.createWebhook(req)
+      : fetchJson<WebhookTargetPublic>('/api/webhooks', {
+          method: 'POST',
+          body: JSON.stringify(req),
+        }),
+
+  updateWebhook: async (id: string, req: WebhookUpdateRequest): Promise<WebhookTargetPublic> =>
+    IS_DEMO_MODE
+      ? demoApi.updateWebhook(id, req)
+      : fetchJson<WebhookTargetPublic>(`/api/webhooks/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          body: JSON.stringify(req),
+        }),
+
+  deleteWebhook: async (id: string): Promise<{ ok: boolean }> =>
+    IS_DEMO_MODE
+      ? demoApi.deleteWebhook(id)
+      : fetchJson<{ ok: boolean }>(`/api/webhooks/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        }),
+
+  testWebhook: async (id: string): Promise<WebhookTestResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.testWebhook()
+      : fetchJson<WebhookTestResponse>(`/api/webhooks/${encodeURIComponent(id)}/test`, {
+          method: 'POST',
+        }),
+
+  ackDelta: async (): Promise<{ ok: boolean }> =>
+    IS_DEMO_MODE
+      ? demoApi.ackDelta()
+      : fetchJson<{ ok: boolean }>('/api/delta/ack', { method: 'POST' }),
+
+  exportSnapshot: async () => {
+    if (IS_DEMO_MODE) {
+      const dash = await demoApi.getDashboard();
+      downloadTextFile(
+        'aibrainworx-demo-snapshot.json',
+        JSON.stringify({ schema_version: '2.0-demo', exported_at: new Date().toISOString(), data: dash }, null, 2),
+        'application/json'
+      );
+      return;
+    }
+    return downloadEndpointFile('/api/snapshot/export', 'aibrainworx-offline-snapshot.json');
+  },
+
+  importSnapshot: async (rawJsonText: string): Promise<SnapshotImportResult> =>
+    IS_DEMO_MODE
+      ? demoApi.importSnapshot()
+      : fetchJson<SnapshotImportResult>('/api/snapshot/import', {
+          method: 'POST',
+          body: rawJsonText,
+        }),
+
+  triggerRefresh: async () =>
+    IS_DEMO_MODE
+      ? { status: 'demo_simulated' }
+      : fetchJson<{ status: string }>('/api/refresh', { method: 'POST' }),
+
+  getRules: async () => {
+    if (IS_DEMO_MODE) {
+      return {
+        min_severity: 'HIGH',
+        alert_on_any_kev: true,
+        alert_on_vuln_news: true,
+        alert_on_ai_threats: true,
+        watchlist_keywords: ['zero-day', 'rce', 'openssl', 'pytorch', 'mcp'],
+        poll_interval_secs: 3600,
+      } as AlertRules;
+    }
+    return fetchJson<AlertRules>('/api/rules');
+  },
 
   updateRules: (rules: AlertRules) =>
-    fetchJson<AlertRules>('/api/rules', {
-      method: 'PUT',
-      body: JSON.stringify(rules),
-    }),
+    IS_DEMO_MODE
+      ? Promise.resolve(rules)
+      : fetchJson<AlertRules>('/api/rules', {
+          method: 'PUT',
+          body: JSON.stringify(rules),
+        }),
 
-  getAiConfig: () => fetchJson<AiConfigPublic>('/api/ai/config'),
+  getAiConfig: () =>
+    IS_DEMO_MODE ? demoApi.getAiConfig() : fetchJson<AiConfigPublic>('/api/ai/config'),
 
   updateAiConfig: (update: AiConfigUpdate) =>
-    fetchJson<AiConfigPublic>('/api/ai/config', {
-      method: 'PUT',
-      body: JSON.stringify(update),
-    }),
+    IS_DEMO_MODE
+      ? demoApi.updateAiConfig(update)
+      : fetchJson<AiConfigPublic>('/api/ai/config', {
+          method: 'PUT',
+          body: JSON.stringify(update),
+        }),
 
   listAiModels: (params: { provider?: AiProviderKind; base_url?: string; api_key?: string }) =>
-    fetchJson<AiModelsResponse>('/api/ai/models', {
-      method: 'POST',
-      body: JSON.stringify(params),
-    }),
+    IS_DEMO_MODE
+      ? Promise.resolve({
+          ok: true,
+          models: ['local-threat-graph-v1'],
+          source: 'Demo',
+          error: null,
+        } as AiModelsResponse)
+      : fetchJson<AiModelsResponse>('/api/ai/models', {
+          method: 'POST',
+          body: JSON.stringify(params),
+        }),
 
   testAiConnection: (params: {
     provider?: AiProviderKind;
@@ -121,27 +430,42 @@ export const api = {
     api_key?: string;
     timeout_secs?: number;
   }) =>
-    fetchJson<AiTestResponse>('/api/ai/test', {
-      method: 'POST',
-      body: JSON.stringify(params),
-    }),
+    IS_DEMO_MODE
+      ? Promise.resolve({
+          ok: true,
+          latency_ms: 4,
+          provider_label: 'Demo Simulator',
+          model: 'local-threat-graph-v1',
+          reply: 'Static Demo Engine active.',
+          error: null,
+        } as AiTestResponse)
+      : fetchJson<AiTestResponse>('/api/ai/test', {
+          method: 'POST',
+          body: JSON.stringify(params),
+        }),
 
   analyzeQuery: (query: string) =>
-    fetchJson<AiQueryResponse>('/api/ai/analyze', {
-      method: 'POST',
-      body: JSON.stringify({ query }),
-    }),
+    IS_DEMO_MODE
+      ? demoApi.analyzeQuery(query)
+      : fetchJson<AiQueryResponse>('/api/ai/analyze', {
+          method: 'POST',
+          body: JSON.stringify({ query }),
+        }),
 
   triageVulnerability: (id: string) =>
-    fetchJson<AiQueryResponse>(`/api/ai/triage/${encodeURIComponent(id)}`, {
-      method: 'POST',
-      body: JSON.stringify({}),
-    }),
+    IS_DEMO_MODE
+      ? demoApi.analyzeQuery(`Deep triage ${id}`)
+      : fetchJson<AiQueryResponse>(`/api/ai/triage/${encodeURIComponent(id)}`, {
+          method: 'POST',
+          body: JSON.stringify({}),
+        }),
 };
 
 export function playAlertChime() {
   try {
-    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const Ctx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!Ctx) return;
     const ctx = new Ctx();
     const now = ctx.currentTime;

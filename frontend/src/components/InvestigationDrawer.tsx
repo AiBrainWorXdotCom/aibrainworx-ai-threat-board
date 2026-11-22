@@ -9,22 +9,27 @@ import { ProgressBar } from '@astryxdesign/core/ProgressBar';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { Text } from '@astryxdesign/core/Text';
 import { Timestamp } from '@astryxdesign/core/Timestamp';
-import { ExternalLink, ShieldAlert, Sparkles } from 'lucide-react';
+import { Download, ExternalLink, Save, ShieldAlert, Sparkles } from 'lucide-react';
 import { api, safeExternalUrl, severityBadgeVariant } from '../api';
-import type { AiQueryResponse, ThreatNewsItem, Vulnerability } from '../types';
+import type { AiQueryResponse, ThreatNewsItem, TriageStatus, Vulnerability } from '../types';
+import { sanitizeMarkdownClient } from '../utils/opsec';
 
 interface InvestigationDrawerProps {
   vulnId: string | null;
   initialVuln?: Vulnerability | null;
+  readOnly?: boolean;
   onClose: () => void;
   onSelectVulnId: (id: string) => void;
+  onTriageUpdated?: () => void;
 }
 
 export function InvestigationDrawer({
   vulnId,
   initialVuln,
+  readOnly = false,
   onClose,
   onSelectVulnId,
+  onTriageUpdated,
 }: InvestigationDrawerProps) {
   const [vuln, setVuln] = useState<Vulnerability | null>(initialVuln ?? null);
   const [relatedNews, setRelatedNews] = useState<ThreatNewsItem[]>([]);
@@ -33,8 +38,14 @@ export function InvestigationDrawer({
   const [deepTriage, setDeepTriage] = useState<AiQueryResponse | null>(null);
   const [triageLoading, setTriageLoading] = useState(false);
 
+  const [triageStatus, setTriageStatus] = useState<TriageStatus>('new');
+  const [triageNotes, setTriageNotes] = useState('');
+  const [triageSaving, setTriageSaving] = useState(false);
+  const [triageSavedMsg, setTriageSavedMsg] = useState<string | null>(null);
+
   useEffect(() => {
     setDeepTriage(null);
+    setTriageSavedMsg(null);
     if (!vulnId) {
       setVuln(null);
       setRelatedNews([]);
@@ -43,6 +54,8 @@ export function InvestigationDrawer({
     }
     if (initialVuln && initialVuln.id === vulnId) {
       setVuln(initialVuln);
+      setTriageStatus(initialVuln.triage_status ?? 'new');
+      setTriageNotes(initialVuln.triage_notes ?? '');
     }
     let cancelled = false;
     setLoading(true);
@@ -53,6 +66,8 @@ export function InvestigationDrawer({
         if (!cancelled) {
           setVuln(res.vulnerability);
           setRelatedNews(res.related_news);
+          setTriageStatus(res.vulnerability.triage_status ?? 'new');
+          setTriageNotes(res.vulnerability.triage_notes ?? '');
         }
       })
       .catch((err) => {
@@ -73,13 +88,27 @@ export function InvestigationDrawer({
   };
 
   const runDeepTriage = async () => {
-    if (!vuln || triageLoading) return;
+    if (!vuln || triageLoading || readOnly) return;
     setTriageLoading(true);
     try {
       const resp = await api.triageVulnerability(vuln.id);
       setDeepTriage(resp);
     } finally {
       setTriageLoading(false);
+    }
+  };
+
+  const saveAnalystTriage = async () => {
+    if (!vuln || triageSaving || readOnly) return;
+    setTriageSaving(true);
+    setTriageSavedMsg(null);
+    try {
+      const updated = await api.updateVulnTriage(vuln.id, triageStatus, triageNotes);
+      setVuln({ ...vuln, triage_status: updated.status, triage_notes: updated.notes });
+      setTriageSavedMsg('Saved');
+      onTriageUpdated?.();
+    } finally {
+      setTriageSaving(false);
     }
   };
 
@@ -150,13 +179,65 @@ export function InvestigationDrawer({
                       }
                       label={`AI RISK SCORE ${vuln.ai_risk_score}/100`}
                     />
+                    {vuln.matched_stack && vuln.matched_stack.length > 0 && (
+                      <Badge
+                        variant="warning"
+                        label={`MY STACK: ${vuln.matched_stack.join(', ')}`}
+                      />
+                    )}
                     {vuln.is_kev && <Badge variant="error" label="CISA KEV ACTIVE EXPLOIT" />}
+                    {vuln.kev_days_remaining != null && (
+                      <Badge
+                        variant={
+                          vuln.kev_days_remaining < 0
+                            ? 'error'
+                            : vuln.kev_days_remaining <= 7
+                              ? 'warning'
+                              : 'info'
+                        }
+                        label={
+                          vuln.kev_days_remaining < 0
+                            ? `KEV OVERDUE ${Math.abs(vuln.kev_days_remaining)}d`
+                            : `KEV DUE IN ${vuln.kev_days_remaining}d`
+                        }
+                      />
+                    )}
+                    {vuln.epss_spike && (
+                      <Badge
+                        variant="orange"
+                        label={`EPSS SURGE +${((vuln.epss_delta_24h ?? 0) * 100).toFixed(1)}%`}
+                      />
+                    )}
                     {vuln.ransomware_use && <Badge variant="purple" label="RANSOMWARE LINKED" />}
                     {vuln.has_public_exploit && <Badge variant="orange" label="PUBLIC EXPLOIT / POC" />}
                     {vuln.is_ai_related && <Badge variant="cyan" label="AI / ML INFRASTRUCTURE" />}
                     {vuln.sources.map((s) => (
                       <Badge key={s} variant="neutral" label={s} />
                     ))}
+                  </div>
+
+                  <div className="abw-flex-wrap" style={{ gap: 6 }}>
+                    <Button
+                      label="Export MD"
+                      size="sm"
+                      variant="secondary"
+                      icon={<Download size={12} />}
+                      onClick={() => void api.exportSingleVuln(vuln.id, 'markdown')}
+                    />
+                    <Button
+                      label="Export JSON"
+                      size="sm"
+                      variant="secondary"
+                      icon={<Download size={12} />}
+                      onClick={() => void api.exportSingleVuln(vuln.id, 'json')}
+                    />
+                    <Button
+                      label="Export STIX 2.1"
+                      size="sm"
+                      variant="secondary"
+                      icon={<Download size={12} />}
+                      onClick={() => void api.exportSingleVuln(vuln.id, 'stix')}
+                    />
                   </div>
 
                   <div>
@@ -171,6 +252,54 @@ export function InvestigationDrawer({
 
                   <section className="abw-panel">
                     <div className="abw-panel-head">
+                      <span className="abw-panel-title">SOC Analyst Triage Workflow</span>
+                      {triageSavedMsg && <Badge variant="success" label={triageSavedMsg} />}
+                    </div>
+                    <div className="abw-panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <div className="abw-flex-wrap" style={{ alignItems: 'center', justifyContent: 'space-between' }}>
+                        <select
+                          className="abw-select"
+                          aria-label="Triage Status"
+                          disabled={readOnly}
+                          value={triageStatus}
+                          onChange={(e) => setTriageStatus(e.target.value as TriageStatus)}
+                        >
+                          <option value="new">Status: New / Untriaged</option>
+                          <option value="investigating">Status: Investigating</option>
+                          <option value="mitigated">Status: Mitigated / Patched</option>
+                          <option value="false_positive">Status: False Positive</option>
+                          <option value="accepted">Status: Risk Accepted</option>
+                        </select>
+                        <Button
+                          label={triageSaving ? 'Saving...' : 'Save Triage'}
+                          size="sm"
+                          variant="primary"
+                          icon={<Save size={12} />}
+                          isLoading={triageSaving}
+                          isDisabled={readOnly}
+                          onClick={() => void saveAnalystTriage()}
+                        />
+                      </div>
+                      <textarea
+                        rows={2}
+                        disabled={readOnly}
+                        value={triageNotes}
+                        onChange={(e) => setTriageNotes(e.target.value)}
+                        placeholder="Record owner, compensating WAF rules, ticket ID, or verification notes..."
+                        style={{
+                          width: '100%',
+                          background: 'var(--soc-surface)',
+                          border: '1px solid var(--soc-border)',
+                          color: 'var(--soc-text)',
+                          padding: '6px 8px',
+                          fontSize: 12,
+                        }}
+                      />
+                    </div>
+                  </section>
+
+                  <section className="abw-panel">
+                    <div className="abw-panel-head">
                       <span className="abw-panel-title">
                         <Sparkles size={13} color="#66efab" />
                         AiBrainWorX AI Triage Assessment
@@ -180,6 +309,7 @@ export function InvestigationDrawer({
                         size="sm"
                         variant="secondary"
                         isLoading={triageLoading}
+                        isDisabled={readOnly}
                         onClick={() => void runDeepTriage()}
                       />
                     </div>
@@ -201,7 +331,9 @@ export function InvestigationDrawer({
                               Fallback reason: {deepTriage.fallback_reason}
                             </Text>
                           )}
-                          <Markdown density="compact">{deepTriage.answer_markdown}</Markdown>
+                          <Markdown density="compact">
+                            {sanitizeMarkdownClient(deepTriage.answer_markdown)}
+                          </Markdown>
                         </div>
                       )}
                     </div>

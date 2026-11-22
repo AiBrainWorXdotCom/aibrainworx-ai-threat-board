@@ -8,10 +8,12 @@ import { TextInput } from '@astryxdesign/core/TextInput';
 import { Cpu, Send, Sparkles } from 'lucide-react';
 import { api } from '../api';
 import type { AiQueryResponse } from '../types';
+import { sanitizeMarkdownClient } from '../utils/opsec';
 
 interface AiAnalystViewProps {
   activeProvider: string;
   activeModel: string;
+  readOnly?: boolean;
   onSelectVulnId: (id: string) => void;
   onOpenAiModels: () => void;
 }
@@ -33,6 +35,7 @@ const PRESET_PROMPTS = [
 export function AiAnalystView({
   activeProvider,
   activeModel,
+  readOnly = false,
   onSelectVulnId,
   onOpenAiModels,
 }: AiAnalystViewProps) {
@@ -43,7 +46,7 @@ export function AiAnalystView({
 
   const submitQuery = async (promptText?: string) => {
     const q = (promptText ?? query).trim();
-    if (!q || loading) return;
+    if (!q || loading || readOnly) return;
     setLoading(true);
     setError(null);
     if (!promptText) setQuery('');
@@ -99,6 +102,7 @@ export function AiAnalystView({
               variant="primary"
               icon={<Send size={13} />}
               isLoading={loading}
+              isDisabled={readOnly}
               onClick={() => void submitQuery()}
             />
           </div>
@@ -110,7 +114,7 @@ export function AiAnalystView({
                 label={p}
                 size="sm"
                 variant="secondary"
-                isDisabled={loading}
+                isDisabled={loading || readOnly}
                 onClick={() => void submitQuery(p)}
               />
             ))}
@@ -162,7 +166,7 @@ export function AiAnalystView({
               </div>
             )}
 
-            <Markdown>{t.response.answer_markdown}</Markdown>
+            <Markdown>{sanitizeMarkdownClient(t.response.answer_markdown)}</Markdown>
 
             {t.response.cited_cves.length > 0 && (
               <div style={{ borderTop: '1px solid var(--soc-border)', paddingTop: 10 }}>

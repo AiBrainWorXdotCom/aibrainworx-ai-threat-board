@@ -12,10 +12,14 @@ use crate::analyzer::{
     strip_html_and_clean, truncate_str,
 };
 use crate::models::{
-    AttackerIp, BotnetC2, EpssTopThreat, FeedHealth, PhishingUrl, PortAttack, Severity, SseEvent,
-    ThreatNewsItem, Vulnerability,
+    AttackerIp, BotnetC2, CustomFeedConfig, CustomFeedKind, EpssSpike, EpssTopThreat, FeedHealth,
+    PhishingUrl, PortAttack, Severity, SseEvent, SweepDelta, ThreatNewsItem, TriageStatus,
+    Vulnerability,
 };
+use crate::security::{build_pinned_http_client, validate_outbound_url, OutboundUrlPolicy};
+use crate::stack::correlate_stack;
 use crate::store::AppState;
+use crate::webhooks::{build_dispatch_items, dispatch_webhooks_batch};
 
 const USER_AGENT: &str = "AiBrainWorXCyberThreatBoard/1.0 (Local SOC Dashboard)";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(18);
@@ -113,6 +117,11 @@ const RSS_FEEDS: &[RssFeedDef] = &[
 ];
 
 pub async fn run_sweep(state: AppState) {
+    if state.server_mode.offline_mode {
+        info!("Offline air-gapped mode active; skipping remote feed sweep.");
+        return;
+    }
+
     if state
         .sweep_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -126,9 +135,45 @@ pub async fn run_sweep(state: AppState) {
     let _ = state.sse_tx.send(SseEvent::SweepStarted { started_at });
     info!("Starting concurrent public cybersecurity threat sweep...");
 
+    let (disabled_feeds, custom_feeds, prev_cve_ids, prev_kev_ids, prev_stack_ids) = {
+        let store = state.store.read().await;
+        let disabled: HashSet<String> = store
+            .feed_settings
+            .disabled_feeds
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let custom: Vec<CustomFeedConfig> = store
+            .feed_settings
+            .custom_feeds
+            .iter()
+            .filter(|f| f.enabled)
+            .cloned()
+            .collect();
+        let cves: HashSet<String> = store.vulnerabilities.keys().cloned().collect();
+        let kevs: HashSet<String> = store
+            .vulnerabilities
+            .values()
+            .filter(|v| v.is_kev)
+            .map(|v| v.id.clone())
+            .collect();
+        let stack_ids: HashSet<String> = store
+            .vulnerabilities
+            .values()
+            .filter(|v| !v.matched_stack.is_empty())
+            .map(|v| v.id.clone())
+            .collect();
+        (disabled, custom, cves, kevs, stack_ids)
+    };
+
+    let is_disabled = |id: &str, name: &str| {
+        disabled_feeds.contains(&id.to_ascii_lowercase())
+            || disabled_feeds.contains(&name.to_ascii_lowercase())
+    };
+
     let http = state.http.clone();
 
-    // Launch all independent feed categories concurrently
+    // Launch all independent feed categories concurrently, skipping disabled feeds cleanly.
     let (
         (kev_vulns, kev_set, kev_health),
         (nvd_vulns, nvd_health),
@@ -144,21 +189,209 @@ pub async fn run_sweep(state: AppState) {
         (top_epss_global, epss_global_health),
         (hn_news, hn_health),
         rss_results,
+        custom_outcome,
     ) = tokio::join!(
-        fetch_cisa_kev(&http),
-        fetch_nvd_recent(&http),
-        fetch_github_advisories(&http),
-        fetch_circl_recent(&http),
-        fetch_osv_ai_watchlist(&http),
-        fetch_sans_infocon(&http),
-        fetch_sans_top_ports(&http),
-        fetch_sans_top_ips(&http),
-        fetch_feodo_c2(&http),
-        fetch_openphish(&http),
-        fetch_emerging_threats(&http),
-        fetch_epss_top(&http),
-        fetch_hn_algolia(&http),
-        fetch_all_rss(&http),
+        async {
+            if is_disabled("cisa_kev", "CISA Known Exploited Vulnerabilities") {
+                (
+                    Vec::new(),
+                    HashSet::new(),
+                    disabled_health(
+                        "cisa_kev",
+                        "CISA Known Exploited Vulnerabilities",
+                        "Vulnerability DB",
+                        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                    ),
+                )
+            } else {
+                fetch_cisa_kev(&http).await
+            }
+        },
+        async {
+            if is_disabled("nvd_api", "NIST NVD CVE 2.0 (7-Day)") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "nvd_api",
+                        "NIST NVD CVE 2.0 (7-Day)",
+                        "Vulnerability DB",
+                        "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                    ),
+                )
+            } else {
+                fetch_nvd_recent(&http).await
+            }
+        },
+        async {
+            if is_disabled("github_advisories", "GitHub Security Advisories") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "github_advisories",
+                        "GitHub Security Advisories",
+                        "Vulnerability DB",
+                        "https://api.github.com/advisories",
+                    ),
+                )
+            } else {
+                fetch_github_advisories(&http).await
+            }
+        },
+        async {
+            if is_disabled("circl_cve", "CIRCL Vulnerability Feed") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "circl_cve",
+                        "CIRCL Vulnerability Feed",
+                        "Vulnerability DB",
+                        "https://cve.circl.lu/api/last",
+                    ),
+                )
+            } else {
+                fetch_circl_recent(&http).await
+            }
+        },
+        async {
+            if is_disabled("osv_ai", "OSV.dev AI/ML Supply Chain") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "osv_ai",
+                        "OSV.dev AI/ML Supply Chain",
+                        "AI Supply Chain",
+                        "https://api.osv.dev/v1/query",
+                    ),
+                )
+            } else {
+                fetch_osv_ai_watchlist(&http).await
+            }
+        },
+        async {
+            if is_disabled("sans_infocon", "SANS ISC INFOCON Status") {
+                (
+                    None,
+                    disabled_health(
+                        "sans_infocon",
+                        "SANS ISC INFOCON Status",
+                        "Network Telemetry",
+                        "https://isc.sans.edu/api/infocon?json",
+                    ),
+                )
+            } else {
+                fetch_sans_infocon(&http).await
+            }
+        },
+        async {
+            if is_disabled("sans_ports", "SANS ISC Top Attacked Ports") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "sans_ports",
+                        "SANS ISC Top Attacked Ports",
+                        "Network Telemetry",
+                        "https://isc.sans.edu/api/topports/records/15?json",
+                    ),
+                )
+            } else {
+                fetch_sans_top_ports(&http).await
+            }
+        },
+        async {
+            if is_disabled("sans_ips", "SANS ISC Top Attacking IPs") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "sans_ips",
+                        "SANS ISC Top Attacking IPs",
+                        "Network Telemetry",
+                        "https://isc.sans.edu/api/sources/attacks/25?json",
+                    ),
+                )
+            } else {
+                fetch_sans_top_ips(&http).await
+            }
+        },
+        async {
+            if is_disabled("feodo_c2", "abuse.ch Feodo Botnet C2s") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "feodo_c2",
+                        "abuse.ch Feodo Botnet C2s",
+                        "IOC & Malware",
+                        "https://feodotracker.abuse.ch/downloads/ipblocklist.json",
+                    ),
+                )
+            } else {
+                fetch_feodo_c2(&http).await
+            }
+        },
+        async {
+            if is_disabled("openphish", "OpenPhish Live Phishing Feed") {
+                (
+                    Vec::new(),
+                    0,
+                    disabled_health(
+                        "openphish",
+                        "OpenPhish Live Phishing Feed",
+                        "IOC & Malware",
+                        "https://openphish.com/feed.txt",
+                    ),
+                )
+            } else {
+                fetch_openphish(&http).await
+            }
+        },
+        async {
+            if is_disabled("et_compromised", "Emerging Threats Compromised IPs") {
+                (
+                    HashSet::new(),
+                    Vec::new(),
+                    0,
+                    disabled_health(
+                        "et_compromised",
+                        "Emerging Threats Compromised IPs",
+                        "IOC & Malware",
+                        "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+                    ),
+                )
+            } else {
+                fetch_emerging_threats(&http).await
+            }
+        },
+        async {
+            if is_disabled("first_epss_top", "FIRST.org EPSS Top Risks") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "first_epss_top",
+                        "FIRST.org EPSS Top Risks",
+                        "Exploit Prediction",
+                        "https://api.first.org/data/v1/epss?order=!epss&limit=25",
+                    ),
+                )
+            } else {
+                fetch_epss_top(&http).await
+            }
+        },
+        async {
+            if is_disabled("hn_security", "Hacker News Security Wire") {
+                (
+                    Vec::new(),
+                    disabled_health(
+                        "hn_security",
+                        "Hacker News Security Wire",
+                        "Community",
+                        "https://hn.algolia.com",
+                    ),
+                )
+            } else {
+                fetch_hn_algolia(&http).await
+            }
+        },
+        fetch_all_rss(&http, &disabled_feeds),
+        fetch_custom_feeds(&custom_feeds),
     );
 
     let now = Utc::now();
@@ -171,6 +404,7 @@ pub async fn run_sweep(state: AppState) {
         .chain(gh_vulns)
         .chain(circl_vulns)
         .chain(osv_vulns)
+        .chain(custom_outcome.vulns)
     {
         merge_vuln_into(&mut merged_vulns, v);
     }
@@ -188,10 +422,28 @@ pub async fn run_sweep(state: AppState) {
         .filter(|v| v.id.starts_with("CVE-") && v.epss_score.is_none())
         .map(|v| (v.published_at, v.id.clone()))
         .collect();
-    cve_candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    let cve_ids_to_enrich: Vec<String> = cve_candidates.into_iter().take(120).map(|(_, id)| id).collect();
+    cve_candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let cve_ids_to_enrich: Vec<String> = cve_candidates
+        .into_iter()
+        .take(120)
+        .map(|(_, id)| id)
+        .collect();
 
-    let (epss_map, epss_enrich_health) = fetch_epss_batch(&http, &cve_ids_to_enrich).await;
+    let (epss_map, epss_enrich_health) =
+        if is_disabled("first_epss_enrich", "FIRST.org EPSS CVE Scorer") {
+            (
+                HashMap::new(),
+                disabled_health(
+                    "first_epss_enrich",
+                    "FIRST.org EPSS CVE Scorer",
+                    "Exploit Prediction",
+                    "https://api.first.org/data/v1/epss",
+                ),
+            )
+        } else {
+            fetch_epss_batch(&http, &cve_ids_to_enrich).await
+        };
+
     for (cve_id, (epss, pct)) in epss_map {
         if let Some(v) = merged_vulns.get_mut(&cve_id) {
             v.epss_score = Some(epss);
@@ -199,8 +451,20 @@ pub async fn run_sweep(state: AppState) {
         }
     }
 
+    // Record EPSS samples in SQLite (outside lock) & gather delta baseline map
+    let epss_samples: Vec<(String, f64, DateTime<Utc>)> = merged_vulns
+        .values()
+        .filter_map(|v| v.epss_score.map(|score| (v.id.clone(), score, now)))
+        .collect();
+    if !epss_samples.is_empty() {
+        if let Err(e) = state.db.record_epss_samples(&epss_samples) {
+            warn!("Failed recording EPSS history samples: {e}");
+        }
+    }
+
     // Gather all news items and cross-correlate exploit signals
     let mut all_news: Vec<ThreatNewsItem> = hn_news;
+    all_news.extend(custom_outcome.news);
     let mut feed_healths: Vec<FeedHealth> = vec![
         kev_health,
         nvd_health,
@@ -222,12 +486,18 @@ pub async fn run_sweep(state: AppState) {
         all_news.extend(items);
         feed_healths.push(health);
     }
+    feed_healths.extend(custom_outcome.healths);
 
     // Analyze news & extract exploit-linked CVEs
     let mut exploit_cves: HashSet<String> = HashSet::new();
     for item in &mut all_news {
         analyze_news_item(item, &kev_set);
-        if item.category == "Exploit PoC" || item.tags.iter().any(|t| t == "Exploit PoC" || t == "Zero-Day") {
+        if item.category == "Exploit PoC"
+            || item
+                .tags
+                .iter()
+                .any(|t| t == "Exploit PoC" || t == "Zero-Day")
+        {
             for cve in &item.extracted_cves {
                 exploit_cves.insert(cve.clone());
             }
@@ -241,8 +511,23 @@ pub async fn run_sweep(state: AppState) {
         enrich_vulnerability(v, now);
     }
 
+    // Compute EPSS deltas against stored baseline across merged CVEs before committing
+    let current_epss_scores: HashMap<String, f64> = merged_vulns
+        .values()
+        .filter_map(|v| v.epss_score.map(|s| (v.id.clone(), s)))
+        .collect();
+    let epss_deltas = state.db.compute_epss_deltas(&current_epss_scores, now);
+
     // Commit everything into the store under write lock
-    let (new_alerts, total_vulns, total_news, next_sweep_at) = {
+    let (
+        new_alerts,
+        total_vulns,
+        total_news,
+        next_sweep_at,
+        webhook_targets,
+        dispatch_items,
+        delta_to_save,
+    ) = {
         let mut store = state.store.write().await;
 
         if !kev_set.is_empty() {
@@ -257,6 +542,24 @@ pub async fn run_sweep(state: AppState) {
                 enrich_vulnerability(existing, now);
             } else {
                 store.vulnerabilities.insert(id, v);
+            }
+        }
+
+        // Apply EPSS 24h / 7d delta tracking and KEV countdown across all tracked CVEs
+        {
+            let store_ref = &mut *store;
+            for v in store_ref.vulnerabilities.values_mut() {
+                v.kev_days_remaining =
+                    crate::analyzer::compute_kev_days_remaining(v.kev_due_date.as_deref(), now);
+                if let Some((d24, d7)) = epss_deltas.get(&v.id) {
+                    v.epss_delta_24h = *d24;
+                    v.epss_delta_7d = *d7;
+                    v.epss_spike = d24.is_some_and(|delta| delta >= 0.15);
+                }
+                if let Some(t) = store_ref.triage_map.get(&v.id) {
+                    v.triage_status = t.status;
+                    v.triage_notes = t.notes.clone();
+                }
             }
         }
 
@@ -296,11 +599,134 @@ pub async fn run_sweep(state: AppState) {
             store.telemetry.top_epss_global = top_epss_global;
         }
 
-        feed_healths.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+        // Merge BYO custom IOC indicators safely
+        if !custom_outcome.ioc_ips.is_empty() {
+            for ip in custom_outcome.ioc_ips {
+                if store.compromised_ips_set.insert(ip.clone()) {
+                    store.telemetry.compromised_ips_total_count += 1;
+                    if store.telemetry.compromised_ips_sample.len() < 400 {
+                        store.telemetry.compromised_ips_sample.push(ip);
+                    }
+                }
+            }
+        }
+        if !custom_outcome.phish_urls.is_empty() {
+            let existing: HashSet<String> = store
+                .telemetry
+                .phishing_urls
+                .iter()
+                .map(|p| p.url.clone())
+                .collect();
+            for ph in custom_outcome.phish_urls {
+                if !existing.contains(&ph.url) && store.telemetry.phishing_urls.len() < 500 {
+                    store.telemetry.phishing_urls.push(ph);
+                    store.telemetry.phishing_total_count += 1;
+                }
+            }
+        }
+
+        // Persist custom feed statuses back into config
+        for (feed_id, status, cnt, checked) in custom_outcome.status_updates {
+            if let Some(cf) = store
+                .feed_settings
+                .custom_feeds
+                .iter_mut()
+                .find(|f| f.id == feed_id)
+            {
+                cf.last_status = Some(status);
+                cf.last_item_count = cnt;
+                cf.last_checked = Some(checked);
+            }
+        }
+
+        // Correlate My Stack BEFORE alerts and AI brief so stack exposure drives triage & alerts
+        let stack_summary = {
+            let store_ref = &mut *store;
+            correlate_stack(&mut store_ref.vulnerabilities, &store_ref.my_stack)
+        };
+
+        feed_healths.sort_by(|a, b| {
+            a.category
+                .cmp(&b.category)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         store.feed_health = feed_healths;
 
         let rules_snapshot = store.rules.clone();
         let new_alerts = evaluate_alerts(&mut store, &rules_snapshot, now);
+
+        // Compute sweep delta ("What Changed Since Last Check")
+        let mut new_cves: Vec<String> = store
+            .vulnerabilities
+            .keys()
+            .filter(|id| !prev_cve_ids.is_empty() && !prev_cve_ids.contains(*id))
+            .cloned()
+            .collect();
+        new_cves.sort();
+        new_cves.truncate(40);
+
+        let mut new_kevs: Vec<String> = store
+            .vulnerabilities
+            .values()
+            .filter(|v| v.is_kev && !prev_kev_ids.is_empty() && !prev_kev_ids.contains(&v.id))
+            .map(|v| v.id.clone())
+            .collect();
+        new_kevs.sort();
+
+        let mut new_stack_hits: Vec<String> = if stack_summary.configured {
+            store
+                .vulnerabilities
+                .values()
+                .filter(|v| !v.matched_stack.is_empty() && !prev_stack_ids.contains(&v.id))
+                .map(|v| v.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        new_stack_hits.sort();
+
+        let mut epss_spikes: Vec<EpssSpike> = store
+            .vulnerabilities
+            .values()
+            .filter(|v| v.epss_spike)
+            .map(|v| EpssSpike {
+                cve_id: v.id.clone(),
+                title: v.title.clone(),
+                severity: v.severity,
+                current_epss_pct: v.epss_score.unwrap_or(0.0) * 100.0,
+                delta_24h_pct: v.epss_delta_24h.unwrap_or(0.0) * 100.0,
+                is_kev: v.is_kev,
+                matched_stack: v.matched_stack.clone(),
+            })
+            .collect();
+        epss_spikes.sort_by(|a, b| {
+            b.delta_24h_pct
+                .partial_cmp(&a.delta_24h_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        epss_spikes.truncate(15);
+
+        let delta = SweepDelta {
+            sweep_at: now,
+            new_cves,
+            new_kevs,
+            new_stack_hits,
+            epss_spikes,
+            new_alerts_count: new_alerts.len(),
+            reviewed: false,
+        };
+        let has_changes = !delta.new_cves.is_empty()
+            || !delta.new_kevs.is_empty()
+            || !delta.new_stack_hits.is_empty()
+            || !delta.epss_spikes.is_empty()
+            || delta.new_alerts_count > 0;
+        let delta_to_save = if has_changes || store.latest_delta.is_none() {
+            store.latest_delta = Some(delta.clone());
+            Some(delta)
+        } else {
+            None
+        };
+
         store.ai_brief = generate_ai_brief(&store, now);
 
         store.last_sweep_at = Some(now);
@@ -308,24 +734,66 @@ pub async fn run_sweep(state: AppState) {
         let next_at = now + chrono::Duration::seconds(interval as i64);
         store.next_sweep_at = Some(next_at);
         store.total_sweeps += 1;
+        store.initialized = true;
         store.prune();
 
-        if let Err(e) = store.save_to_disk(&state.data_path) {
+        if let Err(e) = state.persist_store(&store) {
             warn!("Failed to persist threat store: {}", e);
         }
+
+        let webhook_targets: Vec<_> = store
+            .webhooks
+            .iter()
+            .filter(|w| w.enabled)
+            .cloned()
+            .collect();
+        let dispatch_items = if !webhook_targets.is_empty() && !new_alerts.is_empty() {
+            build_dispatch_items(&new_alerts, &store.vulnerabilities)
+        } else {
+            Vec::new()
+        };
 
         (
             new_alerts,
             store.vulnerabilities.len(),
             store.news.len(),
             next_at,
+            webhook_targets,
+            dispatch_items,
+            delta_to_save,
         )
     };
+
+    if let Some(delta) = delta_to_save {
+        if let Err(e) = state.db.record_sweep_delta(&delta) {
+            warn!("Failed recording sweep delta: {e}");
+        }
+    }
 
     // Emit SSE alerts individually so frontend shows live banner + toast immediately
     let new_alert_count = new_alerts.len();
     for alert in new_alerts {
         let _ = state.sse_tx.send(SseEvent::NewAlert(alert));
+    }
+
+    // Dispatch matching outbound webhooks outside any lock
+    if !webhook_targets.is_empty() && !dispatch_items.is_empty() {
+        let results = dispatch_webhooks_batch(webhook_targets, dispatch_items).await;
+        if !results.is_empty() {
+            let mut store = state.store.write().await;
+            for (hook_id, ok, msg) in results {
+                if let Some(hook) = store.webhooks.iter_mut().find(|w| w.id == hook_id) {
+                    hook.last_sent_at = Some(Utc::now());
+                    hook.last_status = Some(msg);
+                    if ok {
+                        hook.failure_count = 0;
+                    } else {
+                        hook.failure_count = hook.failure_count.saturating_add(1);
+                    }
+                }
+            }
+            let _ = state.persist_store(&store);
+        }
     }
 
     let _ = state.sse_tx.send(SseEvent::SweepCompleted {
@@ -343,6 +811,385 @@ pub async fn run_sweep(state: AppState) {
     );
 }
 
+fn disabled_health(id: &str, name: &str, category: &str, url: &str) -> FeedHealth {
+    FeedHealth {
+        id: id.to_string(),
+        name: name.to_string(),
+        category: category.to_string(),
+        url: url.to_string(),
+        status: "DISABLED".to_string(),
+        http_status: None,
+        latency_ms: 0,
+        items_fetched: 0,
+        last_success_at: None,
+        last_error: Some("Disabled in Feed Settings".to_string()),
+    }
+}
+
+#[derive(Default)]
+struct CustomFeedOutcome {
+    vulns: Vec<Vulnerability>,
+    news: Vec<ThreatNewsItem>,
+    ioc_ips: Vec<String>,
+    phish_urls: Vec<PhishingUrl>,
+    healths: Vec<FeedHealth>,
+    status_updates: Vec<(String, String, usize, DateTime<Utc>)>,
+}
+
+/// Fetches enabled user-configured BYO feeds strictly through DNS-pinned public HTTPS SSRF guard.
+async fn fetch_custom_feeds(feeds: &[CustomFeedConfig]) -> CustomFeedOutcome {
+    let mut outcome = CustomFeedOutcome::default();
+    if feeds.is_empty() {
+        return outcome;
+    }
+
+    for feed in feeds {
+        let t0 = Instant::now();
+        let now = Utc::now();
+        let mut health = base_health(&feed.id, &feed.name, "Custom Feed", &feed.url);
+
+        let validated =
+            match validate_outbound_url(&feed.url, OutboundUrlPolicy::StrictPublicHttps).await {
+                Ok(v) => v,
+                Err(e) => {
+                    health.status = "ERROR".to_string();
+                    health.last_error = Some(format!("Blocked by SSRF policy: {e}"));
+                    outcome
+                        .status_updates
+                        .push((feed.id.clone(), format!("Blocked: {e}"), 0, now));
+                    outcome.healths.push(health);
+                    continue;
+                }
+            };
+
+        let client = match build_pinned_http_client(&validated, REQUEST_TIMEOUT, USER_AGENT) {
+            Ok(c) => c,
+            Err(e) => {
+                health.status = "ERROR".to_string();
+                health.last_error = Some(e.clone());
+                outcome.status_updates.push((feed.id.clone(), e, 0, now));
+                outcome.healths.push(health);
+                continue;
+            }
+        };
+
+        let resp =
+            match tokio::time::timeout(REQUEST_TIMEOUT, client.get(validated.url).send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    let msg = e.without_url().to_string();
+                    health.status = "ERROR".to_string();
+                    health.latency_ms = t0.elapsed().as_millis() as u64;
+                    health.last_error = Some(msg.clone());
+                    outcome.status_updates.push((feed.id.clone(), msg, 0, now));
+                    outcome.healths.push(health);
+                    continue;
+                }
+                Err(_) => {
+                    health.status = "ERROR".to_string();
+                    health.latency_ms = t0.elapsed().as_millis() as u64;
+                    health.last_error = Some("Request timeout".to_string());
+                    outcome
+                        .status_updates
+                        .push((feed.id.clone(), "Timeout".into(), 0, now));
+                    outcome.healths.push(health);
+                    continue;
+                }
+            };
+
+        let code = resp.status().as_u16();
+        health.http_status = Some(code);
+        if !resp.status().is_success() {
+            health.status = "ERROR".to_string();
+            health.latency_ms = t0.elapsed().as_millis() as u64;
+            health.last_error = Some(format!("HTTP {code}"));
+            outcome
+                .status_updates
+                .push((feed.id.clone(), format!("HTTP {code}"), 0, now));
+            outcome.healths.push(health);
+            continue;
+        }
+
+        let bytes = match read_bounded_bytes(resp, MAX_FEED_BYTES).await {
+            Ok(b) => b,
+            Err(e) => {
+                health.status = "ERROR".to_string();
+                health.latency_ms = t0.elapsed().as_millis() as u64;
+                health.last_error = Some(e.clone());
+                outcome.status_updates.push((feed.id.clone(), e, 0, now));
+                outcome.healths.push(health);
+                continue;
+            }
+        };
+
+        health.latency_ms = t0.elapsed().as_millis() as u64;
+        let mut count = 0usize;
+        match feed.kind {
+            CustomFeedKind::RssAtom => {
+                if let Ok(parsed) = feed_rs::parser::parse(&bytes[..]) {
+                    for entry in parsed.entries.into_iter().take(40) {
+                        let title = entry
+                            .title
+                            .map(|t| strip_html_and_clean(&t.content))
+                            .unwrap_or_default();
+                        if title.is_empty() {
+                            continue;
+                        }
+                        let link = entry
+                            .links
+                            .into_iter()
+                            .next()
+                            .and_then(|l| sanitize_http_url(&l.href))
+                            .unwrap_or_else(|| feed.url.clone());
+                        let summary = entry
+                            .summary
+                            .map(|s| s.content)
+                            .or_else(|| entry.content.and_then(|c| c.body))
+                            .map(|s| strip_html_and_clean(&s))
+                            .unwrap_or_default();
+                        let pub_dt = entry.published.or(entry.updated).unwrap_or(now);
+                        outcome.news.push(ThreatNewsItem {
+                            id: format!("custom-{}-{}", feed.id, entry.id),
+                            source: feed.name.clone(),
+                            category: "Custom Advisory".to_string(),
+                            title,
+                            summary: truncate_str(&summary, 500),
+                            url: link,
+                            published_at: pub_dt,
+                            first_seen_at: now,
+                            extracted_cves: Vec::new(),
+                            severity: Severity::Info,
+                            ai_risk_score: 0,
+                            tags: vec!["Custom Feed".to_string()],
+                            is_vulnerability_news: false,
+                            is_ai_related: false,
+                            ai_triage_note: String::new(),
+                        });
+                        count += 1;
+                    }
+                    health.status = "OK".to_string();
+                } else {
+                    health.status = "ERROR".to_string();
+                    health.last_error = Some("Invalid RSS/Atom XML".to_string());
+                }
+            }
+            CustomFeedKind::IocText => {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines().take(500) {
+                    let trimmed = line.split('#').next().unwrap_or("").trim();
+                    if trimmed.is_empty() || trimmed.starts_with(';') {
+                        continue;
+                    }
+                    if trimmed.parse::<std::net::IpAddr>().is_ok() {
+                        outcome.ioc_ips.push(trimmed.to_string());
+                        count += 1;
+                    } else if let Some(u) = sanitize_http_url(trimmed) {
+                        let domain = url::Url::parse(&u)
+                            .ok()
+                            .and_then(|p| p.host_str().map(str::to_string))
+                            .unwrap_or_default();
+                        outcome.phish_urls.push(PhishingUrl {
+                            url: u,
+                            domain,
+                            suspected_brand: Some(feed.name.clone()),
+                        });
+                        count += 1;
+                    }
+                }
+                health.status = "OK".to_string();
+            }
+            CustomFeedKind::Stix21 => {
+                if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(objs) = val.get("objects").and_then(|o| o.as_array()) {
+                        for obj in objs.iter().take(400) {
+                            let otype = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if otype == "vulnerability" {
+                                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                if name.to_ascii_uppercase().starts_with("CVE-") {
+                                    let desc = obj
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("");
+                                    outcome.vulns.push(custom_cve_stub(
+                                        &name.to_ascii_uppercase(),
+                                        desc,
+                                        &feed.name,
+                                        now,
+                                    ));
+                                    count += 1;
+                                }
+                            } else if otype == "indicator" {
+                                let pattern =
+                                    obj.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+                                if let Some(val_str) = extract_stix_pattern_literal(pattern) {
+                                    if val_str.parse::<std::net::IpAddr>().is_ok() {
+                                        outcome.ioc_ips.push(val_str);
+                                        count += 1;
+                                    } else if let Some(u) = sanitize_http_url(&val_str) {
+                                        let domain = url::Url::parse(&u)
+                                            .ok()
+                                            .and_then(|p| p.host_str().map(str::to_string))
+                                            .unwrap_or_default();
+                                        outcome.phish_urls.push(PhishingUrl {
+                                            url: u,
+                                            domain,
+                                            suspected_brand: Some(feed.name.clone()),
+                                        });
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        health.status = "OK".to_string();
+                    } else {
+                        health.status = "ERROR".to_string();
+                        health.last_error = Some("Expected STIX 2.1 Bundle with objects[]".into());
+                    }
+                } else {
+                    health.status = "ERROR".to_string();
+                    health.last_error = Some("Invalid STIX JSON".into());
+                }
+            }
+            CustomFeedKind::MispJson => {
+                if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+                    let attrs = val
+                        .pointer("/Event/Attribute")
+                        .and_then(|a| a.as_array())
+                        .or_else(|| val.get("Attribute").and_then(|a| a.as_array()));
+                    if let Some(arr) = attrs {
+                        for attr in arr.iter().take(500) {
+                            let atype = attr.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let aval = attr
+                                .get("value")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            if aval.is_empty() {
+                                continue;
+                            }
+                            if matches!(atype, "ip-src" | "ip-dst")
+                                && aval.parse::<std::net::IpAddr>().is_ok()
+                            {
+                                outcome.ioc_ips.push(aval.to_string());
+                                count += 1;
+                            } else if atype == "url" {
+                                if let Some(u) = sanitize_http_url(aval) {
+                                    let domain = url::Url::parse(&u)
+                                        .ok()
+                                        .and_then(|p| p.host_str().map(str::to_string))
+                                        .unwrap_or_default();
+                                    outcome.phish_urls.push(PhishingUrl {
+                                        url: u,
+                                        domain,
+                                        suspected_brand: Some(feed.name.clone()),
+                                    });
+                                    count += 1;
+                                }
+                            } else if atype == "vulnerability"
+                                && aval.to_ascii_uppercase().starts_with("CVE-")
+                            {
+                                let comment =
+                                    attr.get("comment").and_then(|c| c.as_str()).unwrap_or("");
+                                outcome.vulns.push(custom_cve_stub(
+                                    &aval.to_ascii_uppercase(),
+                                    comment,
+                                    &feed.name,
+                                    now,
+                                ));
+                                count += 1;
+                            }
+                        }
+                        health.status = "OK".to_string();
+                    } else {
+                        health.status = "ERROR".to_string();
+                        health.last_error = Some("Expected MISP Event.Attribute[] JSON".into());
+                    }
+                } else {
+                    health.status = "ERROR".to_string();
+                    health.last_error = Some("Invalid MISP JSON".into());
+                }
+            }
+        }
+
+        health.items_fetched = count;
+        if health.status == "OK" {
+            health.last_success_at = Some(now);
+            outcome.status_updates.push((
+                feed.id.clone(),
+                format!("OK ({count} items)"),
+                count,
+                now,
+            ));
+        } else {
+            let err = health.last_error.clone().unwrap_or_else(|| "ERROR".into());
+            outcome.status_updates.push((feed.id.clone(), err, 0, now));
+        }
+        outcome.healths.push(health);
+    }
+
+    outcome
+}
+
+fn custom_cve_stub(
+    cve_id: &str,
+    desc: &str,
+    source_name: &str,
+    now: DateTime<Utc>,
+) -> Vulnerability {
+    Vulnerability {
+        id: cve_id.to_string(),
+        aliases: Vec::new(),
+        title: if desc.trim().is_empty() {
+            cve_id.to_string()
+        } else {
+            truncate_str(desc, 120)
+        },
+        description: truncate_str(desc, 1200),
+        severity: Severity::High,
+        cvss_score: None,
+        cvss_vector: None,
+        epss_score: None,
+        epss_percentile: None,
+        ai_risk_score: 0,
+        ai_score_factors: Vec::new(),
+        ai_summary: String::new(),
+        is_kev: false,
+        kev_date_added: None,
+        kev_due_date: None,
+        kev_required_action: None,
+        forensic_triage: None,
+        ransomware_use: false,
+        has_public_exploit: false,
+        is_ai_related: false,
+        vendor: None,
+        product: None,
+        ecosystem: None,
+        patched_version: None,
+        cwes: Vec::new(),
+        mitre_tactics: Vec::new(),
+        attack_vectors: Vec::new(),
+        sources: vec![source_name.to_string()],
+        references: Vec::new(),
+        published_at: now,
+        updated_at: now,
+        first_seen_at: now,
+        epss_delta_24h: None,
+        epss_delta_7d: None,
+        epss_spike: false,
+        kev_days_remaining: None,
+        matched_stack: Vec::new(),
+        triage_status: TriageStatus::New,
+        triage_notes: String::new(),
+    }
+}
+
+fn extract_stix_pattern_literal(pattern: &str) -> Option<String> {
+    let start = pattern.find('\'')?;
+    let rest = &pattern[start + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].trim().to_string())
+}
+
 fn merge_vuln_into(map: &mut HashMap<String, Vulnerability>, incoming: Vulnerability) {
     if let Some(existing) = map.remove(&incoming.id) {
         let merged = merge_two_vulns(existing, incoming);
@@ -358,10 +1205,11 @@ fn merge_two_vulns(mut a: Vulnerability, b: Vulnerability) -> Vulnerability {
             a.aliases.push(alias);
         }
     }
-    if b.title.len() > a.title.len() && !b.title.is_empty() {
-        if a.title.starts_with("CVE-") || a.title.starts_with("GHSA-") {
-            a.title = b.title;
-        }
+    if b.title.len() > a.title.len()
+        && !b.title.is_empty()
+        && (a.title.starts_with("CVE-") || a.title.starts_with("GHSA-"))
+    {
+        a.title = b.title;
     }
     if b.description.len() > a.description.len() {
         a.description = b.description;
@@ -369,10 +1217,10 @@ fn merge_two_vulns(mut a: Vulnerability, b: Vulnerability) -> Vulnerability {
     if b.severity.rank() > a.severity.rank() {
         a.severity = b.severity;
     }
-    if a.cvss_score.is_none() || b.cvss_score.unwrap_or(0.0) > a.cvss_score.unwrap_or(0.0) {
-        if b.cvss_score.is_some() {
-            a.cvss_score = b.cvss_score;
-        }
+    if (a.cvss_score.is_none() || b.cvss_score.unwrap_or(0.0) > a.cvss_score.unwrap_or(0.0))
+        && b.cvss_score.is_some()
+    {
+        a.cvss_score = b.cvss_score;
     }
     if a.cvss_vector.is_none() {
         a.cvss_vector = b.cvss_vector;
@@ -436,10 +1284,17 @@ fn merge_two_vulns(mut a: Vulnerability, b: Vulnerability) -> Vulnerability {
 // =========================================================================
 // Feed 1: CISA KEV
 // =========================================================================
-async fn fetch_cisa_kev(http: &reqwest::Client) -> (Vec<Vulnerability>, HashSet<String>, FeedHealth) {
+async fn fetch_cisa_kev(
+    http: &reqwest::Client,
+) -> (Vec<Vulnerability>, HashSet<String>, FeedHealth) {
     let url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
     let t0 = Instant::now();
-    let mut health = base_health("cisa_kev", "CISA Known Exploited Vulnerabilities", "Vulnerability DB", url);
+    let mut health = base_health(
+        "cisa_kev",
+        "CISA Known Exploited Vulnerabilities",
+        "Vulnerability DB",
+        url,
+    );
 
     match send_get_json(http, url).await {
         Ok((status, val)) => {
@@ -471,8 +1326,14 @@ async fn fetch_cisa_kev(http: &reqwest::Client) -> (Vec<Vulnerability>, HashSet<
                     Some(c) if !c.is_empty() => c.to_ascii_uppercase(),
                     _ => continue,
                 };
-                let vendor = item.get("vendorProject").and_then(|x| x.as_str()).map(str::to_string);
-                let product = item.get("product").and_then(|x| x.as_str()).map(str::to_string);
+                let vendor = item
+                    .get("vendorProject")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                let product = item
+                    .get("product")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
                 let title = item
                     .get("vulnerabilityName")
                     .and_then(|x| x.as_str())
@@ -483,10 +1344,22 @@ async fn fetch_cisa_kev(http: &reqwest::Client) -> (Vec<Vulnerability>, HashSet<
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
                     .to_string();
-                let date_added = item.get("dateAdded").and_then(|x| x.as_str()).map(str::to_string);
-                let due_date = item.get("dueDate").and_then(|x| x.as_str()).map(str::to_string);
-                let req_action = item.get("requiredAction").and_then(|x| x.as_str()).map(str::to_string);
-                let triage = item.get("forensicTriage").and_then(|x| x.as_str()).map(str::to_string);
+                let date_added = item
+                    .get("dateAdded")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                let due_date = item
+                    .get("dueDate")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                let req_action = item
+                    .get("requiredAction")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
+                let triage = item
+                    .get("forensicTriage")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
                 let ransomware = item
                     .get("knownRansomwareCampaignUse")
                     .and_then(|x| x.as_str())
@@ -553,6 +1426,13 @@ async fn fetch_cisa_kev(http: &reqwest::Client) -> (Vec<Vulnerability>, HashSet<
                     published_at: published,
                     updated_at: published,
                     first_seen_at: now,
+                    epss_delta_24h: None,
+                    epss_delta_7d: None,
+                    epss_spike: false,
+                    kev_days_remaining: None,
+                    matched_stack: Vec::new(),
+                    triage_status: TriageStatus::New,
+                    triage_notes: String::new(),
                 });
             }
 
@@ -586,7 +1466,12 @@ async fn fetch_nvd_recent(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHe
     );
     let display_url = "https://services.nvd.nist.gov/rest/json/cves/2.0";
     let t0 = Instant::now();
-    let mut health = base_health("nvd_api", "NIST NVD CVE 2.0 (7-Day)", "Vulnerability DB", display_url);
+    let mut health = base_health(
+        "nvd_api",
+        "NIST NVD CVE 2.0 (7-Day)",
+        "Vulnerability DB",
+        display_url,
+    );
 
     match send_get_json(http, &url).await {
         Ok((status, val)) => {
@@ -648,7 +1533,11 @@ async fn fetch_nvd_recent(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHe
                     .and_then(|r| r.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|x| x.get("url").and_then(|u| u.as_str()).and_then(sanitize_http_url))
+                            .filter_map(|x| {
+                                x.get("url")
+                                    .and_then(|u| u.as_str())
+                                    .and_then(sanitize_http_url)
+                            })
                             .take(6)
                             .collect()
                     })
@@ -704,6 +1593,13 @@ async fn fetch_nvd_recent(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHe
                     published_at: published,
                     updated_at: updated,
                     first_seen_at: now,
+                    epss_delta_24h: None,
+                    epss_delta_7d: None,
+                    epss_spike: false,
+                    kev_days_remaining: None,
+                    matched_stack: Vec::new(),
+                    triage_status: TriageStatus::New,
+                    triage_notes: String::new(),
                 });
             }
 
@@ -727,11 +1623,18 @@ fn extract_nvd_cvss(metrics: Option<&Value>) -> (Option<f64>, Option<String>, Op
         Some(v) => v,
         None => return (None, None, None),
     };
-    for key in ["cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"] {
+    for key in [
+        "cvssMetricV40",
+        "cvssMetricV31",
+        "cvssMetricV30",
+        "cvssMetricV2",
+    ] {
         if let Some(arr) = m.get(key).and_then(|x| x.as_array()) {
             if let Some(first) = arr.first() {
                 let data = first.get("cvssData");
-                let score = data.and_then(|d| d.get("baseScore")).and_then(|s| s.as_f64());
+                let score = data
+                    .and_then(|d| d.get("baseScore"))
+                    .and_then(|s| s.as_f64());
                 let vector = data
                     .and_then(|d| d.get("vectorString"))
                     .and_then(|s| s.as_str())
@@ -756,7 +1659,12 @@ fn extract_nvd_cvss(metrics: Option<&Value>) -> (Option<f64>, Option<String>, Op
 async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHealth) {
     let url = "https://api.github.com/advisories?per_page=50";
     let t0 = Instant::now();
-    let mut health = base_health("github_advisories", "GitHub Security Advisories", "Vulnerability DB", url);
+    let mut health = base_health(
+        "github_advisories",
+        "GitHub Security Advisories",
+        "Vulnerability DB",
+        url,
+    );
     let now = Utc::now();
 
     let resp = tokio::time::timeout(
@@ -818,7 +1726,10 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
                             .and_then(|x| x.as_str())
                             .unwrap_or(&title)
                             .to_string();
-                        let sev_str = item.get("severity").and_then(|x| x.as_str()).unwrap_or("medium");
+                        let sev_str = item
+                            .get("severity")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("medium");
                         let severity = Severity::from_str_loose(sev_str);
                         let cvss_score = item.pointer("/cvss/score").and_then(|x| x.as_f64());
                         let cvss_vector = item
@@ -830,12 +1741,17 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
                             .and_then(|x| x.as_array())
                             .map(|arr| {
                                 arr.iter()
-                                    .filter_map(|c| c.get("cwe_id").and_then(|v| v.as_str()).map(str::to_string))
+                                    .filter_map(|c| {
+                                        c.get("cwe_id").and_then(|v| v.as_str()).map(str::to_string)
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default();
 
-                        let first_vuln = item.get("vulnerabilities").and_then(|v| v.as_array()).and_then(|a| a.first());
+                        let first_vuln = item
+                            .get("vulnerabilities")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.first());
                         let ecosystem = first_vuln
                             .and_then(|v| v.pointer("/package/ecosystem"))
                             .and_then(|x| x.as_str())
@@ -899,6 +1815,13 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
                             published_at: published,
                             updated_at: updated,
                             first_seen_at: now,
+                            epss_delta_24h: None,
+                            epss_delta_7d: None,
+                            epss_spike: false,
+                            kev_days_remaining: None,
+                            matched_stack: Vec::new(),
+                            triage_status: TriageStatus::New,
+                            triage_notes: String::new(),
                         });
                     }
                     health.status = "OK".to_string();
@@ -939,7 +1862,12 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
 async fn fetch_circl_recent(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHealth) {
     let url = "https://cve.circl.lu/api/last/40";
     let t0 = Instant::now();
-    let mut health = base_health("circl_cve", "CIRCL Vulnerability Feed", "Vulnerability DB", url);
+    let mut health = base_health(
+        "circl_cve",
+        "CIRCL Vulnerability Feed",
+        "Vulnerability DB",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -980,7 +1908,12 @@ async fn fetch_circl_recent(http: &reqwest::Client) -> (Vec<Vulnerability>, Feed
 async fn fetch_osv_ai_watchlist(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHealth) {
     let url = "https://api.osv.dev/v1/querybatch";
     let t0 = Instant::now();
-    let mut health = base_health("osv_ai", "OSV.dev AI/ML Supply Chain", "AI Supply Chain", url);
+    let mut health = base_health(
+        "osv_ai",
+        "OSV.dev AI/ML Supply Chain",
+        "AI Supply Chain",
+        url,
+    );
     let now = Utc::now();
 
     let packages = [
@@ -1098,7 +2031,10 @@ fn parse_osv_or_cve_json(
 ) -> Option<Vulnerability> {
     // Handle CVE 5.0 records if CIRCL returns one
     if let Some(meta) = item.get("cveMetadata") {
-        let cve_id = meta.get("cveId").and_then(|x| x.as_str())?.to_ascii_uppercase();
+        let cve_id = meta
+            .get("cveId")
+            .and_then(|x| x.as_str())?
+            .to_ascii_uppercase();
         let cna = item.pointer("/containers/cna");
         let desc = cna
             .and_then(|c| c.get("descriptions"))
@@ -1137,7 +2073,11 @@ fn parse_osv_or_cve_json(
             .and_then(|r| r.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|x| x.get("url").and_then(|u| u.as_str()).and_then(sanitize_http_url))
+                    .filter_map(|x| {
+                        x.get("url")
+                            .and_then(|u| u.as_str())
+                            .and_then(sanitize_http_url)
+                    })
                     .take(5)
                     .collect()
             })
@@ -1176,6 +2116,13 @@ fn parse_osv_or_cve_json(
             published_at: published,
             updated_at: published,
             first_seen_at: now,
+            epss_delta_24h: None,
+            epss_delta_7d: None,
+            epss_spike: false,
+            kev_days_remaining: None,
+            matched_stack: Vec::new(),
+            triage_status: TriageStatus::New,
+            triage_notes: String::new(),
         });
     }
 
@@ -1223,7 +2170,10 @@ fn parse_osv_or_cve_json(
             }
         });
 
-    let affected_first = item.get("affected").and_then(|a| a.as_array()).and_then(|a| a.first());
+    let affected_first = item
+        .get("affected")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first());
     let ecosystem = affected_first
         .and_then(|a| a.pointer("/package/ecosystem"))
         .and_then(|x| x.as_str())
@@ -1238,7 +2188,11 @@ fn parse_osv_or_cve_json(
         .and_then(|arr| arr.first())
         .and_then(|r| r.get("events"))
         .and_then(|e| e.as_array())
-        .and_then(|events| events.iter().find_map(|ev| ev.get("fixed").and_then(|f| f.as_str())))
+        .and_then(|events| {
+            events
+                .iter()
+                .find_map(|ev| ev.get("fixed").and_then(|f| f.as_str()))
+        })
         .map(str::to_string);
 
     let cvss_vector = item
@@ -1260,7 +2214,11 @@ fn parse_osv_or_cve_json(
         .and_then(|r| r.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.get("url").and_then(|u| u.as_str()).and_then(sanitize_http_url))
+                .filter_map(|x| {
+                    x.get("url")
+                        .and_then(|u| u.as_str())
+                        .and_then(sanitize_http_url)
+                })
                 .take(6)
                 .collect()
         })
@@ -1320,6 +2278,13 @@ fn parse_osv_or_cve_json(
         published_at: published,
         updated_at: updated,
         first_seen_at: now,
+        epss_delta_24h: None,
+        epss_delta_7d: None,
+        epss_spike: false,
+        kev_days_remaining: None,
+        matched_stack: Vec::new(),
+        triage_status: TriageStatus::New,
+        triage_notes: String::new(),
     })
 }
 
@@ -1329,7 +2294,12 @@ fn parse_osv_or_cve_json(
 async fn fetch_epss_top(http: &reqwest::Client) -> (Vec<EpssTopThreat>, FeedHealth) {
     let url = "https://api.first.org/data/v1/epss?order=!epss&limit=25";
     let t0 = Instant::now();
-    let mut health = base_health("first_epss_top", "FIRST.org EPSS Top Risks", "Exploit Prediction", url);
+    let mut health = base_health(
+        "first_epss_top",
+        "FIRST.org EPSS Top Risks",
+        "Exploit Prediction",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1358,7 +2328,12 @@ async fn fetch_epss_batch(
 ) -> (HashMap<String, (f64, f64)>, FeedHealth) {
     let base_url = "https://api.first.org/data/v1/epss";
     let t0 = Instant::now();
-    let mut health = base_health("first_epss_enrich", "FIRST.org EPSS CVE Scorer", "Exploit Prediction", base_url);
+    let mut health = base_health(
+        "first_epss_enrich",
+        "FIRST.org EPSS CVE Scorer",
+        "Exploit Prediction",
+        base_url,
+    );
     let now = Utc::now();
     let mut out = HashMap::new();
 
@@ -1407,7 +2382,10 @@ fn parse_epss_data(val: &Value) -> Vec<EpssTopThreat> {
         .map(|arr| {
             arr.iter()
                 .filter_map(|item| {
-                    let cve = item.get("cve").and_then(|x| x.as_str())?.to_ascii_uppercase();
+                    let cve = item
+                        .get("cve")
+                        .and_then(|x| x.as_str())?
+                        .to_ascii_uppercase();
                     let epss = val_to_f64(item.get("epss"))?;
                     let percentile = val_to_f64(item.get("percentile")).unwrap_or(0.0);
                     let date = item
@@ -1433,7 +2411,12 @@ fn parse_epss_data(val: &Value) -> Vec<EpssTopThreat> {
 async fn fetch_sans_infocon(http: &reqwest::Client) -> (Option<String>, FeedHealth) {
     let url = "https://isc.sans.edu/api/infocon?json";
     let t0 = Instant::now();
-    let mut health = base_health("sans_infocon", "SANS ISC INFOCON Status", "Network Telemetry", url);
+    let mut health = base_health(
+        "sans_infocon",
+        "SANS ISC INFOCON Status",
+        "Network Telemetry",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1462,7 +2445,12 @@ async fn fetch_sans_infocon(http: &reqwest::Client) -> (Option<String>, FeedHeal
 async fn fetch_sans_top_ports(http: &reqwest::Client) -> (Vec<PortAttack>, FeedHealth) {
     let url = "https://isc.sans.edu/api/topports/records/12?json";
     let t0 = Instant::now();
-    let mut health = base_health("sans_ports", "SANS ISC Top Attacked Ports", "Network Telemetry", url);
+    let mut health = base_health(
+        "sans_ports",
+        "SANS ISC Top Attacked Ports",
+        "Network Telemetry",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1508,7 +2496,12 @@ async fn fetch_sans_top_ports(http: &reqwest::Client) -> (Vec<PortAttack>, FeedH
 async fn fetch_sans_top_ips(http: &reqwest::Client) -> (Vec<AttackerIp>, FeedHealth) {
     let url = "https://isc.sans.edu/api/sources/attacks/20?json";
     let t0 = Instant::now();
-    let mut health = base_health("sans_ips", "SANS ISC Top Attacking IPs", "Network Telemetry", url);
+    let mut health = base_health(
+        "sans_ips",
+        "SANS ISC Top Attacking IPs",
+        "Network Telemetry",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1523,8 +2516,16 @@ async fn fetch_sans_top_ips(http: &reqwest::Client) -> (Vec<AttackerIp>, FeedHea
                         ip,
                         attacks: val_to_u64(item.get("attacks")).unwrap_or(0),
                         count: val_to_u64(item.get("count")).unwrap_or(0),
-                        first_seen: item.get("firstseen").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                        last_seen: item.get("lastseen").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        first_seen: item
+                            .get("firstseen")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        last_seen: item
+                            .get("lastseen")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     })
                 })
                 .collect();
@@ -1556,7 +2557,12 @@ async fn fetch_sans_top_ips(http: &reqwest::Client) -> (Vec<AttackerIp>, FeedHea
 async fn fetch_feodo_c2(http: &reqwest::Client) -> (Vec<BotnetC2>, FeedHealth) {
     let url = "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json";
     let t0 = Instant::now();
-    let mut health = base_health("feodo_c2", "abuse.ch Feodo Botnet C2s", "IOC & Malware", url);
+    let mut health = base_health(
+        "feodo_c2",
+        "abuse.ch Feodo Botnet C2s",
+        "IOC & Malware",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1570,14 +2576,37 @@ async fn fetch_feodo_c2(http: &reqwest::Client) -> (Vec<BotnetC2>, FeedHealth) {
                     Some(BotnetC2 {
                         ip_address,
                         port: val_to_u64(item.get("port")).unwrap_or(0) as u16,
-                        status: item.get("status").and_then(|x| x.as_str()).unwrap_or("unknown").to_string(),
-                        hostname: item.get("hostname").and_then(|x| x.as_str()).map(str::to_string),
+                        status: item
+                            .get("status")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        hostname: item
+                            .get("hostname")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
                         as_number: val_to_u64(item.get("as_number")),
-                        as_name: item.get("as_name").and_then(|x| x.as_str()).map(str::to_string),
-                        country: item.get("country").and_then(|x| x.as_str()).map(str::to_string),
-                        malware: item.get("malware").and_then(|x| x.as_str()).unwrap_or("Botnet").to_string(),
-                        first_seen: item.get("first_seen").and_then(|x| x.as_str()).map(str::to_string),
-                        last_online: item.get("last_online").and_then(|x| x.as_str()).map(str::to_string),
+                        as_name: item
+                            .get("as_name")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        country: item
+                            .get("country")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        malware: item
+                            .get("malware")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("Botnet")
+                            .to_string(),
+                        first_seen: item
+                            .get("first_seen")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        last_online: item
+                            .get("last_online")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
                     })
                 })
                 .collect();
@@ -1606,7 +2635,12 @@ async fn fetch_feodo_c2(http: &reqwest::Client) -> (Vec<BotnetC2>, FeedHealth) {
 async fn fetch_openphish(http: &reqwest::Client) -> (Vec<PhishingUrl>, usize, FeedHealth) {
     let url = "https://openphish.com/feed.txt";
     let t0 = Instant::now();
-    let mut health = base_health("openphish", "OpenPhish Live Phishing Feed", "IOC & Malware", url);
+    let mut health = base_health(
+        "openphish",
+        "OpenPhish Live Phishing Feed",
+        "IOC & Malware",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_text(http, url).await {
@@ -1628,7 +2662,10 @@ async fn fetch_openphish(http: &reqwest::Client) -> (Vec<PhishingUrl>, usize, Fe
                         .and_then(|u| u.host_str().map(str::to_string))
                         .unwrap_or_else(|| "unknown".to_string());
                     let lower = raw_url.to_ascii_lowercase();
-                    let brand = if lower.contains("microsoft") || lower.contains("office") || lower.contains("outlook") {
+                    let brand = if lower.contains("microsoft")
+                        || lower.contains("office")
+                        || lower.contains("outlook")
+                    {
                         Some("Microsoft".to_string())
                     } else if lower.contains("google") || lower.contains("gmail") {
                         Some("Google".to_string())
@@ -1642,7 +2679,10 @@ async fn fetch_openphish(http: &reqwest::Client) -> (Vec<PhishingUrl>, usize, Fe
                         Some("DocuSign".to_string())
                     } else if lower.contains("github") {
                         Some("GitHub".to_string())
-                    } else if lower.contains("meta") || lower.contains("facebook") || lower.contains("instagram") {
+                    } else if lower.contains("meta")
+                        || lower.contains("facebook")
+                        || lower.contains("instagram")
+                    {
                         Some("Meta".to_string())
                     } else {
                         None
@@ -1675,7 +2715,12 @@ async fn fetch_emerging_threats(
 ) -> (HashSet<String>, Vec<String>, usize, FeedHealth) {
     let url = "https://rules.emergingthreats.net/blockrules/compromised-ips.txt";
     let t0 = Instant::now();
-    let mut health = base_health("et_compromised", "Emerging Threats Compromised IPs", "IOC & Malware", url);
+    let mut health = base_health(
+        "et_compromised",
+        "Emerging Threats Compromised IPs",
+        "IOC & Malware",
+        url,
+    );
     let now = Utc::now();
 
     match send_get_text(http, url).await {
@@ -1715,7 +2760,12 @@ async fn fetch_emerging_threats(
 async fn fetch_hn_algolia(http: &reqwest::Client) -> (Vec<ThreatNewsItem>, FeedHealth) {
     let url = "https://hn.algolia.com/api/v1/search_by_date?query=CVE+OR+zero-day+OR+vulnerability+OR+ransomware&tags=story&hitsPerPage=30";
     let t0 = Instant::now();
-    let mut health = base_health("hn_security", "Hacker News Security Wire", "Community", "https://hn.algolia.com");
+    let mut health = base_health(
+        "hn_security",
+        "Hacker News Security Wire",
+        "Community",
+        "https://hn.algolia.com",
+    );
     let now = Utc::now();
 
     match send_get_json(http, url).await {
@@ -1761,7 +2811,10 @@ async fn fetch_hn_algolia(http: &reqwest::Client) -> (Vec<ThreatNewsItem>, FeedH
                     source: "Hacker News".to_string(),
                     category: "Community".to_string(),
                     title,
-                    summary: format!("Community security discussion ({} points, {} comments).", points, comments),
+                    summary: format!(
+                        "Community security discussion ({} points, {} comments).",
+                        points, comments
+                    ),
                     url: link,
                     published_at: published,
                     first_seen_at: now,
@@ -1789,8 +2842,22 @@ async fn fetch_hn_algolia(http: &reqwest::Client) -> (Vec<ThreatNewsItem>, FeedH
     }
 }
 
-async fn fetch_all_rss(http: &reqwest::Client) -> Vec<(Vec<ThreatNewsItem>, FeedHealth)> {
-    let futs = RSS_FEEDS.iter().map(|def| fetch_single_rss(http, def));
+async fn fetch_all_rss(
+    http: &reqwest::Client,
+    disabled_feeds: &HashSet<String>,
+) -> Vec<(Vec<ThreatNewsItem>, FeedHealth)> {
+    let futs = RSS_FEEDS.iter().map(|def| async move {
+        let skipped = disabled_feeds.contains(&def.id.to_ascii_lowercase())
+            || disabled_feeds.contains(&def.name.to_ascii_lowercase());
+        if skipped {
+            (
+                Vec::new(),
+                disabled_health(def.id, def.name, def.category, def.url),
+            )
+        } else {
+            fetch_single_rss(http, def).await
+        }
+    });
     futures::future::join_all(futs).await
 }
 
@@ -1806,7 +2873,10 @@ async fn fetch_single_rss(
         REQUEST_TIMEOUT,
         http.get(def.url)
             .header("User-Agent", USER_AGENT)
-            .header("Accept", "application/rss+xml, application/atom+xml, application/xml, text/xml, */*")
+            .header(
+                "Accept",
+                "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+            )
             .send(),
     )
     .await;
@@ -1846,7 +2916,8 @@ async fn fetch_single_rss(
                                     .map(|s| s.content)
                                     .or_else(|| entry.content.and_then(|c| c.body))
                                     .unwrap_or_default();
-                                let clean_summary = truncate_str(&strip_html_and_clean(&raw_summary), 420);
+                                let clean_summary =
+                                    truncate_str(&strip_html_and_clean(&raw_summary), 420);
                                 let published = entry.published.or(entry.updated).unwrap_or(now);
 
                                 let id_basis = if !entry.id.is_empty() {
@@ -1954,7 +3025,10 @@ async fn read_bounded_bytes(
     Ok(buf)
 }
 
-async fn send_get_json(http: &reqwest::Client, url: &str) -> Result<(u16, Value), (Option<u16>, String)> {
+async fn send_get_json(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<(u16, Value), (Option<u16>, String)> {
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
         http.get(url).header("User-Agent", USER_AGENT).send(),
@@ -1975,7 +3049,10 @@ async fn send_get_json(http: &reqwest::Client, url: &str) -> Result<(u16, Value)
     Ok((status, val))
 }
 
-async fn send_get_text(http: &reqwest::Client, url: &str) -> Result<(u16, String), (Option<u16>, String)> {
+async fn send_get_text(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<(u16, String), (Option<u16>, String)> {
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
         http.get(url).header("User-Agent", USER_AGENT).send(),

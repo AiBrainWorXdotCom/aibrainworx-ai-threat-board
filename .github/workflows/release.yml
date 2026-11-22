@@ -1,0 +1,98 @@
+name: Release Single-File Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: aibrainworx-threat-board-linux-x64
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: aibrainworx-threat-board-windows-x64.exe
+            ext: ".exe"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: aibrainworx-threat-board-macos-arm64
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: aibrainworx-threat-board-macos-x64
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build Production Frontend Bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Single-File Release Binary
+        working-directory: backend
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage Release Binary (Bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "backend/target/${{ matrix.target }}/release/aibrainworx-threat-board${{ matrix.ext }}" "release-assets/${{ matrix.artifact }}"
+
+      - name: Stage Release Binary (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item "backend/target/${{ matrix.target }}/release/aibrainworx-threat-board.exe" "release-assets/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-assets/${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: release-files
+        run: sha256sum * > SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true

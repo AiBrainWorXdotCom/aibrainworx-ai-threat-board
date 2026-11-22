@@ -98,6 +98,20 @@ pub struct Vulnerability {
     pub published_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub first_seen_at: DateTime<Utc>,
+    #[serde(default)]
+    pub epss_delta_24h: Option<f64>,
+    #[serde(default)]
+    pub epss_delta_7d: Option<f64>,
+    #[serde(default)]
+    pub epss_spike: bool,
+    #[serde(default)]
+    pub kev_days_remaining: Option<i64>,
+    #[serde(default)]
+    pub matched_stack: Vec<String>,
+    #[serde(default)]
+    pub triage_status: TriageStatus,
+    #[serde(default)]
+    pub triage_notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,7 +323,9 @@ impl Default for AiThreatBrief {
             generated_at: Utc::now(),
             global_threat_index: 0,
             threat_level_label: "GUARDED".to_string(),
-            executive_summary: "Initializing first intelligence sweep across public cybersecurity feeds...".to_string(),
+            executive_summary:
+                "Initializing first intelligence sweep across public cybersecurity feeds..."
+                    .to_string(),
             key_findings: Vec::new(),
             top_attack_vectors: Vec::new(),
             top_mitre_tactics: Vec::new(),
@@ -371,6 +387,8 @@ pub struct AiConfig {
     pub timeout_secs: u64,
     pub system_prompt: String,
     pub enrich_briefing: bool,
+    pub allow_lan_endpoints: bool,
+    pub save_key_to_keychain: bool,
 }
 
 impl Default for AiConfig {
@@ -385,6 +403,8 @@ impl Default for AiConfig {
             timeout_secs: 60,
             system_prompt: "You are AiBrainWorX, a senior Cyber Threat Intelligence Analyst. Analyze the live CVE, CISA KEV, EPSS, Exploit-DB, news, and network IOC telemetry provided. Cite exact CVE IDs, highlight active exploitation or AI/ML supply-chain exposure, and give concrete prioritized defensive actions in concise Markdown.".to_string(),
             enrich_briefing: false,
+            allow_lan_endpoints: false,
+            save_key_to_keychain: false,
         }
     }
 }
@@ -411,11 +431,15 @@ pub struct AiConfigPublic {
     pub has_api_key: bool,
     pub api_key_masked: String,
     pub env_key_present: bool,
+    pub keychain_available: bool,
+    pub keychain_has_key: bool,
     pub temperature: f32,
     pub max_tokens: u32,
     pub timeout_secs: u64,
     pub system_prompt: String,
     pub enrich_briefing: bool,
+    pub allow_lan_endpoints: bool,
+    pub save_key_to_keychain: bool,
     pub active_label: String,
     pub presets: Vec<AiProviderPreset>,
 }
@@ -432,6 +456,8 @@ pub struct AiConfigUpdate {
     pub timeout_secs: Option<u64>,
     pub system_prompt: Option<String>,
     pub enrich_briefing: Option<bool>,
+    pub allow_lan_endpoints: Option<bool>,
+    pub save_key_to_keychain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -500,6 +526,7 @@ pub struct DashboardKpis {
     pub kev_total_catalog: usize,
     pub kev_tracked: usize,
     pub kev_added_7d: usize,
+    pub kev_overdue_count: usize,
     pub high_epss_count: usize,
     pub max_epss_pct: f64,
     pub ai_related_vulns: usize,
@@ -512,6 +539,9 @@ pub struct DashboardKpis {
     pub unacknowledged_alerts: usize,
     pub feeds_ok: usize,
     pub feeds_total: usize,
+    pub stack_exposed_count: usize,
+    pub epss_spike_count: usize,
+    pub triage_investigating_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +560,10 @@ pub struct DashboardPayload {
     pub total_sweeps: u64,
     pub active_ai_provider: String,
     pub active_ai_model: String,
+    pub stack_summary: StackMatchSummary,
+    pub recent_epss_spikes: Vec<EpssSpike>,
+    pub latest_delta: Option<SweepDelta>,
+    pub server_mode: ServerModeInfo,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -545,4 +579,310 @@ pub struct IocHit {
     pub feed: String,
     pub indicator_type: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageStatus {
+    #[default]
+    New,
+    Investigating,
+    Mitigated,
+    FalsePositive,
+    Accepted,
+}
+
+impl TriageStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Investigating => "investigating",
+            Self::Mitigated => "mitigated",
+            Self::FalsePositive => "false_positive",
+            Self::Accepted => "accepted",
+        }
+    }
+
+    pub fn from_db_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "investigating" => Self::Investigating,
+            "mitigated" => Self::Mitigated,
+            "false_positive" | "falsepositive" => Self::FalsePositive,
+            "accepted" => Self::Accepted,
+            _ => Self::New,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CveTriage {
+    pub cve_id: String,
+    pub status: TriageStatus,
+    pub notes: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CveTriageUpdateRequest {
+    pub status: TriageStatus,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StackComponent {
+    pub name: String,
+    pub version: String,
+    pub ecosystem: String,
+    pub source_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MyStackConfig {
+    pub vendors: Vec<String>,
+    pub products: Vec<String>,
+    pub keywords: Vec<String>,
+    pub components: Vec<StackComponent>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MyStackUpdateRequest {
+    pub vendors: Option<Vec<String>>,
+    pub products: Option<Vec<String>>,
+    pub keywords: Option<Vec<String>>,
+    pub components: Option<Vec<StackComponent>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StackImportRequest {
+    pub filename: String,
+    pub content: String,
+    pub replace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StackImportResponse {
+    pub format_detected: String,
+    pub imported_components: usize,
+    pub total_components: usize,
+    pub matched_vulnerabilities: usize,
+    pub config: MyStackConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StackMatchSummary {
+    pub configured: bool,
+    pub component_count: usize,
+    pub vendor_watch_count: usize,
+    pub matched_vuln_count: usize,
+    pub matched_kev_count: usize,
+    pub top_matched_cves: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MyStackPayload {
+    pub config: MyStackConfig,
+    pub summary: StackMatchSummary,
+    pub matched_vulnerabilities: Vec<Vulnerability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookKind {
+    Slack,
+    Discord,
+    Teams,
+    Generic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebhookTarget {
+    pub id: String,
+    pub name: String,
+    pub kind: WebhookKind,
+    pub url: String,
+    pub enabled: bool,
+    pub min_severity: Severity,
+    pub kev_only: bool,
+    pub stack_only: bool,
+    #[serde(skip)]
+    pub signing_secret: String,
+    pub has_signing_secret: bool,
+    pub last_status: Option<String>,
+    pub last_sent_at: Option<DateTime<Utc>>,
+    pub failure_count: u32,
+}
+
+impl Default for WebhookTarget {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            kind: WebhookKind::Generic,
+            url: String::new(),
+            enabled: true,
+            min_severity: Severity::High,
+            kev_only: false,
+            stack_only: false,
+            signing_secret: String::new(),
+            has_signing_secret: false,
+            last_status: None,
+            last_sent_at: None,
+            failure_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookTargetPublic {
+    pub id: String,
+    pub name: String,
+    pub kind: WebhookKind,
+    pub url_masked: String,
+    pub enabled: bool,
+    pub min_severity: Severity,
+    pub kev_only: bool,
+    pub stack_only: bool,
+    pub has_signing_secret: bool,
+    pub last_status: Option<String>,
+    pub last_sent_at: Option<DateTime<Utc>>,
+    pub failure_count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookCreateRequest {
+    pub name: String,
+    pub kind: WebhookKind,
+    pub url: String,
+    pub enabled: Option<bool>,
+    pub min_severity: Option<Severity>,
+    pub kev_only: Option<bool>,
+    pub stack_only: Option<bool>,
+    pub signing_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookUpdateRequest {
+    pub enabled: Option<bool>,
+    pub min_severity: Option<Severity>,
+    pub kev_only: Option<bool>,
+    pub stack_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookTestResponse {
+    pub ok: bool,
+    pub status_code: Option<u16>,
+    pub message: String,
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomFeedKind {
+    RssAtom,
+    IocText,
+    Stix21,
+    MispJson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomFeedConfig {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub kind: CustomFeedKind,
+    pub enabled: bool,
+    pub last_status: Option<String>,
+    pub last_item_count: usize,
+    pub last_checked: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CustomFeedCreateRequest {
+    pub name: String,
+    pub url: String,
+    pub kind: CustomFeedKind,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FeedSettings {
+    pub disabled_feeds: Vec<String>,
+    pub custom_feeds: Vec<CustomFeedConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeedConfigUpdateRequest {
+    pub feed_name: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpssSpike {
+    pub cve_id: String,
+    pub title: String,
+    pub severity: Severity,
+    pub current_epss_pct: f64,
+    pub delta_24h_pct: f64,
+    pub is_kev: bool,
+    pub matched_stack: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepDelta {
+    pub sweep_at: DateTime<Utc>,
+    pub new_cves: Vec<String>,
+    pub new_kevs: Vec<String>,
+    pub new_stack_hits: Vec<String>,
+    pub epss_spikes: Vec<EpssSpike>,
+    pub new_alerts_count: usize,
+    pub reviewed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkIocRequest {
+    pub indicators: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkIocResponse {
+    pub checked: usize,
+    pub matched_count: usize,
+    pub results: Vec<IocLookupResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotImportResult {
+    pub vulnerabilities_imported: usize,
+    pub news_imported: usize,
+    pub snapshot_exported_at: DateTime<Utc>,
+    pub sha256_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ServerModeInfo {
+    pub version: String,
+    pub wallboard_mode: bool,
+    pub offline_mode: bool,
+    pub auth_required: bool,
+    pub authenticated: bool,
+    pub bind_addr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthStatusResponse {
+    pub auth_required: bool,
+    pub authenticated: bool,
+    pub wallboard_mode: bool,
+    pub offline_mode: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthLoginRequest {
+    pub token: String,
 }

@@ -11,20 +11,30 @@ import {
   Bot,
   Cpu,
   Globe,
+  KeyRound,
+  Layers,
+  LogOut,
   Newspaper,
   ShieldAlert,
 } from 'lucide-react';
-import { api, playAlertChime } from './api';
+import { IS_DEMO_MODE, api, playAlertChime } from './api';
 import { AiAnalystView } from './components/AiAnalystView';
 import { AiModelsView } from './components/AiModelsView';
 import { FeedsAndAlertsView } from './components/FeedsAndAlertsView';
 import { InvestigationDrawer } from './components/InvestigationDrawer';
+import { MyStackView } from './components/MyStackView';
 import { NetworkIocView } from './components/NetworkIocView';
 import { NewsIntelView } from './components/NewsIntelView';
 import { OverviewView } from './components/OverviewView';
 import { TopCommandBar } from './components/TopCommandBar';
 import { VulnerabilitiesView } from './components/VulnerabilitiesView';
-import type { DashboardPayload, NavTab, SseEvent, Vulnerability } from './types';
+import type {
+  AuthStatusResponse,
+  DashboardPayload,
+  NavTab,
+  SseEvent,
+  Vulnerability,
+} from './types';
 
 function DashboardWorkspace({
   darkMode,
@@ -39,33 +49,92 @@ function DashboardWorkspace({
   const [loading, setLoading] = useState(true);
   const [sseConnected, setSseConnected] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [opsecMode, setOpsecMode] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem('abw_opsec_mode') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [tokenInput, setTokenInput] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+
   const [drawerVulnId, setDrawerVulnId] = useState<string | null>(null);
   const [drawerInitialVuln, setDrawerInitialVuln] = useState<Vulnerability | null>(null);
 
   const soundRef = useRef(soundEnabled);
   soundRef.current = soundEnabled;
 
+  const toggleOpsecMode = () => {
+    setOpsecMode((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem('abw_opsec_mode', next ? '1' : '0');
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  };
+
   const loadDashboard = useCallback(async () => {
     try {
       const payload = await api.getDashboard();
       setDashboard(payload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('401')) {
+        setAuthStatus((prev) =>
+          prev
+            ? { ...prev, authenticated: false }
+            : { auth_required: true, authenticated: false, wallboard_mode: false, offline_mode: false }
+        );
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void loadDashboard();
-    const bootPoll = window.setInterval(() => {
-      void api.getDashboard().then((p) => {
-        setDashboard(p);
+    let active = true;
+    api
+      .getAuthStatus()
+      .then((status) => {
+        if (!active) return;
+        setAuthStatus(status);
+        if (!status.auth_required || status.authenticated) {
+          void loadDashboard();
+        } else {
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (active) void loadDashboard();
       });
+    return () => {
+      active = false;
+    };
+  }, [loadDashboard]);
+
+  const canQueryApi =
+    authStatus === null ? false : !authStatus.auth_required || authStatus.authenticated;
+
+  useEffect(() => {
+    if (!canQueryApi) return;
+    const bootPoll = window.setInterval(() => {
+      void loadDashboard();
     }, 30000);
     return () => window.clearInterval(bootPoll);
-  }, [loadDashboard]);
+  }, [canQueryApi, loadDashboard]);
 
   // Real-time SSE listener for new vulnerability alerts & hourly sweep events
   useEffect(() => {
+    if (IS_DEMO_MODE || !canQueryApi) {
+      setSseConnected(false);
+      return;
+    }
     const es = new EventSource('/api/events');
     es.onopen = () => setSseConnected(true);
     es.onerror = () => setSseConnected(false);
@@ -183,6 +252,7 @@ function DashboardWorkspace({
 
   const handleTriggerTestAlert = async () => {
     await api.triggerTestAlert();
+    await loadDashboard();
   };
 
   const handleEnableDesktopAlerts = async () => {
@@ -200,6 +270,38 @@ function DashboardWorkspace({
     });
   };
 
+  const serverWallboard = dashboard?.server_mode.wallboard_mode || authStatus?.wallboard_mode || false;
+  const serverOffline = dashboard?.server_mode.offline_mode || authStatus?.offline_mode || false;
+  const authRequired = authStatus?.auth_required || dashboard?.server_mode.auth_required || false;
+  const authenticated = authStatus?.authenticated ?? true;
+
+  const handleLogin = async () => {
+    if (!tokenInput.trim() || loggingIn) return;
+    setLoggingIn(true);
+    setLoginError(null);
+    try {
+      await api.login(tokenInput.trim());
+      setTokenInput('');
+      setAuthStatus((prev) =>
+        prev
+          ? { ...prev, authenticated: true }
+          : { auth_required: true, authenticated: true, wallboard_mode: false, offline_mode: false }
+      );
+      setLoading(true);
+      await loadDashboard();
+    } catch (err) {
+      setLoginError(err instanceof Error ? err.message : 'Invalid access token');
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await api.logout();
+    setDashboard(null);
+    setAuthStatus((prev) => (prev ? { ...prev, authenticated: false } : prev));
+  };
+
   const navSections: {
     heading: string;
     items: {
@@ -207,13 +309,20 @@ function DashboardWorkspace({
       label: string;
       icon: React.ReactNode;
       badge?: number | string;
-      badgeVariant?: 'error' | 'cyan' | 'neutral';
+      badgeVariant?: 'error' | 'cyan' | 'neutral' | 'warning';
     }[];
   }[] = [
     {
       heading: 'Operations',
       items: [
         { id: 'overview', label: 'War Room', icon: <Activity size={15} /> },
+        {
+          id: 'mystack',
+          label: 'My Stack',
+          icon: <Layers size={15} />,
+          badge: dashboard?.kpis.stack_exposed_count,
+          badgeVariant: (dashboard?.kpis.stack_exposed_count ?? 0) > 0 ? 'warning' : 'neutral',
+        },
         {
           id: 'vulnerabilities',
           label: 'Vulnerabilities',
@@ -262,6 +371,64 @@ function DashboardWorkspace({
     },
   ];
 
+  if (authRequired && !authenticated) {
+    return (
+      <div
+        className="abw-shell"
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+        }}
+      >
+        <section className="abw-panel" style={{ width: '100%', maxWidth: 420 }}>
+          <div className="abw-panel-head">
+            <span className="abw-panel-title">
+              <KeyRound size={15} color="#66efab" />
+              AiBrainWorX Threat Board — Access Token Required
+            </span>
+          </div>
+          <div className="abw-panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <Text type="supporting" size="sm">
+              This instance is bound to a non-loopback interface or protected with AUTH_TOKEN. Enter your session access token (or start with default 127.0.0.1 for local zero-auth use).
+            </Text>
+            <input
+              type="password"
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void handleLogin();
+              }}
+              placeholder="Paste AUTH_TOKEN..."
+              style={{
+                width: '100%',
+                padding: '9px 10px',
+                border: '1px solid var(--soc-border-strong)',
+                background: 'var(--soc-surface)',
+                color: 'var(--soc-text)',
+                fontFamily: 'ui-monospace, monospace',
+                fontSize: 13,
+              }}
+            />
+            {loginError && (
+              <Text size="xsm" style={{ color: '#fca5a5' }}>
+                {loginError}
+              </Text>
+            )}
+            <Button
+              label={loggingIn ? 'Authenticating...' : 'Unlock Threat Board'}
+              variant="primary"
+              isLoading={loggingIn}
+              onClick={() => void handleLogin()}
+            />
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   return (
     <div className="abw-shell">
       <TopCommandBar
@@ -271,14 +438,18 @@ function DashboardWorkspace({
         nextSweepAt={dashboard?.next_sweep_at ?? null}
         lastSweepAt={dashboard?.last_sweep_at ?? null}
         sweepInProgress={dashboard?.sweep_in_progress ?? loading}
-        sseConnected={sseConnected}
+        sseConnected={IS_DEMO_MODE ? true : sseConnected}
         unacknowledgedAlerts={dashboard?.kpis.unacknowledged_alerts ?? 0}
         activeAiProvider={dashboard?.active_ai_provider ?? 'Built-in Rust Engine'}
         activeAiModel={dashboard?.active_ai_model ?? 'local-threat-graph-v1'}
         soundEnabled={soundEnabled}
         darkMode={darkMode}
+        opsecMode={opsecMode}
+        wallboardMode={serverWallboard}
+        offlineMode={serverOffline}
         onToggleSound={() => setSoundEnabled((s) => !s)}
         onToggleDarkMode={onToggleDarkMode}
+        onToggleOpsecMode={toggleOpsecMode}
         onEnableDesktopAlerts={() => void handleEnableDesktopAlerts()}
         onRefreshNow={() => void handleRefreshNow()}
         onOpenAlerts={() => setActiveTab('alerts')}
@@ -311,12 +482,23 @@ function DashboardWorkspace({
           ))}
 
           <div className="abw-rail-footer">
-            <div>RUST ENGINE // AXUM 0.8</div>
+            <div>RUST ENGINE // AXUM 0.8 + SQLITE</div>
             <div>
               {dashboard?.kpis.feeds_ok ?? 0}/{dashboard?.kpis.feeds_total ?? 25} FEEDS ·{' '}
               {dashboard?.total_sweeps ?? 0} SWEEPS
             </div>
             <div>META ASTRYX UI v0.7.16</div>
+            {authRequired && authenticated && (
+              <div style={{ marginTop: 6 }}>
+                <Button
+                  label="Lock Session"
+                  size="sm"
+                  variant="secondary"
+                  icon={<LogOut size={12} />}
+                  onClick={() => void handleLogout()}
+                />
+              </div>
+            )}
           </div>
         </aside>
 
@@ -340,10 +522,20 @@ function DashboardWorkspace({
               {activeTab === 'overview' && (
                 <OverviewView
                   data={dashboard}
+                  opsecMode={opsecMode}
+                  readOnly={serverWallboard}
                   onSelectVuln={handleSelectVuln}
                   onSelectVulnId={handleSelectVulnId}
                   onAckAlert={(id) => void handleAckAlert(id)}
+                  onDeltaReviewed={() => void loadDashboard()}
                   onNavigate={setActiveTab}
+                />
+              )}
+              {activeTab === 'mystack' && (
+                <MyStackView
+                  readOnly={serverWallboard}
+                  onSelectVuln={handleSelectVuln}
+                  onStackUpdated={() => void loadDashboard()}
                 />
               )}
               {activeTab === 'vulnerabilities' && (
@@ -353,6 +545,7 @@ function DashboardWorkspace({
               {activeTab === 'network' && (
                 <NetworkIocView
                   telemetry={dashboard.telemetry}
+                  opsecMode={opsecMode}
                   onSelectVulnId={handleSelectVulnId}
                 />
               )}
@@ -360,17 +553,24 @@ function DashboardWorkspace({
                 <AiAnalystView
                   activeProvider={dashboard.active_ai_provider}
                   activeModel={dashboard.active_ai_model}
+                  readOnly={serverWallboard}
                   onSelectVulnId={handleSelectVulnId}
                   onOpenAiModels={() => setActiveTab('models')}
                 />
               )}
               {activeTab === 'models' && (
-                <AiModelsView onConfigSaved={() => void loadDashboard()} />
+                <AiModelsView
+                  readOnly={serverWallboard}
+                  opsecMode={opsecMode}
+                  onConfigSaved={() => void loadDashboard()}
+                />
               )}
               {activeTab === 'alerts' && (
                 <FeedsAndAlertsView
                   alerts={dashboard.alerts}
                   feeds={dashboard.feed_health}
+                  readOnly={serverWallboard}
+                  opsecMode={opsecMode}
                   onAckAlert={(id) => void handleAckAlert(id)}
                   onAckAll={() => void handleAckAll()}
                   onTriggerTestAlert={() => void handleTriggerTestAlert()}
@@ -386,11 +586,13 @@ function DashboardWorkspace({
       <InvestigationDrawer
         vulnId={drawerVulnId}
         initialVuln={drawerInitialVuln}
+        readOnly={serverWallboard}
         onClose={() => {
           setDrawerVulnId(null);
           setDrawerInitialVuln(null);
         }}
         onSelectVulnId={handleSelectVulnId}
+        onTriageUpdated={() => void loadDashboard()}
       />
     </div>
   );

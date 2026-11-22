@@ -5,12 +5,15 @@ import { StatusDot } from '@astryxdesign/core/StatusDot';
 import {
   Bell,
   BellRing,
+  Eye,
+  EyeOff,
   Moon,
   RefreshCw,
   Sun,
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import { IS_DEMO_MODE } from '../api';
 
 interface TopCommandBarProps {
   infoconStatus: string;
@@ -25,8 +28,12 @@ interface TopCommandBarProps {
   activeAiModel: string;
   soundEnabled: boolean;
   darkMode: boolean;
+  opsecMode: boolean;
+  wallboardMode: boolean;
+  offlineMode: boolean;
   onToggleSound: () => void;
   onToggleDarkMode: () => void;
+  onToggleOpsecMode: () => void;
   onEnableDesktopAlerts: () => void;
   onRefreshNow: () => void;
   onOpenAlerts: () => void;
@@ -54,8 +61,12 @@ export function TopCommandBar({
   activeAiModel,
   soundEnabled,
   darkMode,
+  opsecMode,
+  wallboardMode,
+  offlineMode,
   onToggleSound,
   onToggleDarkMode,
+  onToggleOpsecMode,
   onEnableDesktopAlerts,
   onRefreshNow,
   onOpenAlerts,
@@ -91,12 +102,15 @@ export function TopCommandBar({
     <header className="abw-topbar">
       <div className="abw-brand">
         <img
-          src="/aibrainworx-logo.png"
+          src={`${import.meta.env.BASE_URL}aibrainworx-logo.png`}
           alt="AiBrainWorX"
           className="abw-wordmark"
         />
         <span className="abw-brand-divider" aria-hidden="true" />
         <span className="abw-brand-ops">THREAT OPS // AI CYBER ANALYSIS</span>
+        {IS_DEMO_MODE && <Badge variant="info" label="DEMO (SYNTHETIC)" />}
+        {offlineMode && <Badge variant="warning" label="OFFLINE AIR-GAPPED" />}
+        {wallboardMode && <Badge variant="neutral" label="WALLBOARD READ-ONLY" />}
       </div>
 
       <div className="abw-topbar-right">
@@ -173,7 +187,28 @@ export function TopCommandBar({
           size="sm"
           icon={<RefreshCw size={13} />}
           isLoading={sweepInProgress}
+          isDisabled={wallboardMode || offlineMode}
+          tooltip={
+            wallboardMode
+              ? 'Disabled in Read-Only Wallboard Mode'
+              : offlineMode
+                ? 'Disabled in Offline Air-Gapped Mode'
+                : 'Trigger Immediate 25+ Feed Sweep'
+          }
           onClick={onRefreshNow}
+        />
+
+        <Button
+          label={opsecMode ? 'OPSEC ON' : 'OPSEC'}
+          variant={opsecMode ? 'destructive' : 'secondary'}
+          size="sm"
+          icon={opsecMode ? <EyeOff size={13} /> : <Eye size={13} />}
+          tooltip={
+            opsecMode
+              ? 'OPSEC Redact Mode Active: IPs/URLs masked on screen. Click to reveal.'
+              : 'Enable OPSEC Redact Mode for screen sharing / streaming'
+          }
+          onClick={onToggleOpsecMode}
         />
 
         <Button

@@ -1,9 +1,11 @@
 # AiBrainWorX — AI CyberSecurity Threat Analysis Board
 
 [![Watch Launch Video on YouTube](https://img.shields.io/badge/YouTube-Watch_Launch_Video-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/5HoKsq8y_2s)
+[![Interactive Demo](https://img.shields.io/badge/Live_Demo-GitHub_Pages_(Synthetic)-66efab?style=for-the-badge&logo=github)](https://aibrainworxdotcom.github.io/aibrainworx-ai-threat-board/)
+[![CI](https://img.shields.io/github/actions/workflow/status/AiBrainWorXdotCom/aibrainworx-ai-threat-board/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/AiBrainWorXdotCom/aibrainworx-ai-threat-board/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](LICENSE)
 
-**An open-source (MIT), local-first Security Operations Center (SOC) & threat-intelligence correlation dashboard built with Rust and React 19.**
+**An open-source (MIT), local-first, security-hardened SOC & threat-intelligence correlation dashboard packaged as a single executable binary (Rust + SQLite WAL + React 19).**
 
 [![Watch the AiBrainWorX AI Threat Board Launch Video on YouTube](docs/screenshots/youtube-thumbnail.png)](https://youtu.be/5HoKsq8y_2s)
 
@@ -27,9 +29,9 @@ We built this board to consolidate those public intelligence streams into one cr
 - **Cross-Platform & Single-User Workstation Friendly:** Compiles to a fast native Rust binary serving a React 19 + Meta Astryx UI frontend cleanly on **macOS, Linux, and Windows**.
 
 ### What It Is Not
-- **Not an EDR, Firewall, SIEM, or Auto-Patcher:** It does not install agents on endpoints, inspect your internal packet traffic, block IPs on your network, or modify/patch software automatically.
+- **Not an EDR, Firewall, SIEM, or Auto-Patcher:** It does not install agents on endpoints, inspect your internal packet traffic, block IPs automatically, or modify/patch software on hosts.
 - **Not an Active Scanner or Exploitation Tool:** It does not port-scan targets, probe infrastructure, verify vulnerabilities against live hosts, or execute exploits.
-- **Not a Multi-Tenant or Direct Internet-Facing SaaS App:** It binds strictly to `127.0.0.1` with no built-in user authentication and should **not** be exposed directly to a public network without an authenticating TLS reverse proxy.
+- **Not a Public Multi-User SaaS App:** By default it binds strictly to `127.0.0.1`. Non-loopback bindings require an access token (`AUTH_TOKEN`) and should sit behind an HTTPS reverse proxy on shared networks.
 - **Not Infallible Security Advice:** Heuristic scores and AI-generated summaries (especially LLM completions) can miss context or hallucinate details — always validate findings and remediation actions against primary vendor advisories (`NVD`, `CISA`, `GHSA`) before making production changes.
 
 ---
@@ -38,25 +40,44 @@ We built this board to consolidate those public intelligence streams into one cr
 
 - **Defensive & Authorized Research Only:** AiBrainWorX CyberSecurity Threat Analysis Board is intended strictly for defensive security monitoring, vulnerability triage, awareness, and authorized security research.
 - **Respect Upstream Public Data Providers:** This dashboard aggregates volunteer and government-operated public feeds (CISA, NIST NVD, FIRST, SANS ISC, abuse.ch, OpenPhish, Emerging Threats, OSV, CIRCL, GitHub, and security news outlets). Avoid lowering the polling interval aggressively or running automated scraping loops against community endpoints; the default **1-hour (`3600s`)** sweep interval is designed to stay respectful of public rate limits.
-- **Handle Live IOCs Carefully:** The Network IOCs and News views surface real malicious C2 IPs, compromised hosts, and live phishing URLs reported by upstream threat feeds. Inspect links cautiously in isolated analysis environments.
+- **Safe IOC Handling & OPSEC Mode:** Toggle **OPSEC** in the top command bar during screen-shares or streams to mask public attacker IPs and C2 targets (`198.51.xxx.xxx`). Phishing URLs display defanged (`hxxps://`, `[.]`) as non-clickable text.
 - **No Warranty:** Provided `"AS IS"` under the [MIT License](LICENSE) without warranty of any kind. Users remain responsible for operational security decisions and compliance with applicable laws and organizational policies.
 
 ---
 
-## Installation & Running (macOS, Linux, Windows)
+## Installation & Running (Single Binary, Docker, or Build From Source)
 
-### Common Prerequisites
+### Option A — Single-File Binary or Docker (Fastest)
+Once built (or downloaded from **GitHub Releases**), `aibrainworx-threat-board` embeds the entire React UI (`rust-embed`) and embedded SQLite database — just copy one executable anywhere and run:
+
+```bash
+./aibrainworx-threat-board
+# Optional flags:
+#   --wallboard         Read-only kiosk display mode (403 on mutations)
+#   --offline           Air-gapped mode (disables outbound feed sweeps; use Snapshot Import)
+#   --bind <IP>         Bind interface (non-loopback auto-enables AUTH_TOKEN)
+#   --port <PORT>       Listen port (default 8080)
+#   --data-dir <PATH>   Custom SQLite database directory (default ./data)
+```
+
+Or run the multi-stage hardened container (`non-root`, `/data` volume, `HEALTHCHECK`):
+```bash
+docker build -t aibrainworx-threat-board .
+docker run -d --name abw-board -p 127.0.0.1:8080:8080 -e AUTH_TOKEN="$(openssl rand -hex 24)" -v abw_data:/data aibrainworx-threat-board
+```
+
+### Option B — Build From Source (`macOS`, `Linux`, `Windows`)
+
+#### Common Prerequisites
 - **Git**
-- **Rust toolchain** (`1.80+` recommended, via [rustup.rs](https://rustup.rs/))
+- **Rust toolchain** (`1.80+`, tested on `1.99`, via [rustup.rs](https://rustup.rs/))
 - **Node.js `20+` & npm** (`React 19` + `Vite` build)
 
-> Local inference (`Built-in Rust Engine`, `Ollama`, `LM Studio`, `llama.cpp`) works completely offline for AI analysis with zero cloud API keys required.
+> Local inference (`Built-in Rust Engine`, `Ollama`, `LM Studio`, `llama.cpp`) and `--offline` mode work completely air-gapped with zero cloud API keys required.
 
----
+#### macOS (Apple Silicon & Intel)
 
-### macOS (Apple Silicon & Intel)
-
-1. Install Xcode Command Line Tools, Homebrew dependencies, and Rust if not already installed:
+1. Install Xcode Command Line Tools, Node.js, and Rust:
    ```bash
    xcode-select --install || true
    brew install node
@@ -72,27 +93,25 @@ We built this board to consolidate those public intelligence streams into one cr
    ```
 3. Open **http://127.0.0.1:8080** in your browser.
 
----
+#### Linux (Ubuntu/Debian, Fedora/RHEL, Arch)
 
-### Linux (Ubuntu/Debian, Fedora/RHEL, Arch)
-
-The Rust HTTP client (`reqwest`) uses your system TLS stack (`OpenSSL` + `pkg-config`), so install those build headers first:
+The Rust client and optional OS Keychain backend use OpenSSL and D-Bus Secret Service headers:
 
 - **Ubuntu / Debian:**
   ```bash
   sudo apt-get update
-  sudo apt-get install -y build-essential pkg-config libssl-dev curl git
+  sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev curl git
   ```
 - **Fedora / RHEL / Rocky:**
   ```bash
-  sudo dnf install -y gcc pkg-config openssl-devel curl git
+  sudo dnf install -y gcc pkg-config openssl-devel dbus-devel curl git
   ```
 - **Arch Linux:**
   ```bash
-  sudo pacman -S --needed base-devel pkgconf openssl curl git
+  sudo pacman -S --needed base-devel pkgconf openssl dbus curl git
   ```
 
-Then install Rust & Node.js `20+` (via `rustup` and your distro/NodeSource/nvm), clone, and launch:
+Then install Rust & Node.js `20+` (`rustup`), clone, and launch:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -106,9 +125,7 @@ chmod +x start.sh
 
 Open **http://127.0.0.1:8080** in your browser.
 
----
-
-### Windows (PowerShell)
+#### Windows (PowerShell)
 
 1. Ensure **Node.js `20+`**, **Rust** ([rustup.rs](https://rustup.rs/)), and **Visual Studio C++ Build Tools** (Desktop development with C++ workload) are installed.
 2. Clone and start:
@@ -119,40 +136,39 @@ Open **http://127.0.0.1:8080** in your browser.
    ```
 3. Open **http://127.0.0.1:8080** in your browser.
 
----
-
-### Custom Port, Rebuilds & Manual Startup
+#### Custom Flags, Rebuilds & Manual Startup
 
 - **Force a full rebuild** after pulling updates:
   - macOS / Linux: `./start.sh --rebuild`
   - Windows: `.\start.ps1 -Rebuild`
-- **Custom port** (default `8080`):
-  - macOS / Linux: `PORT=9090 ./start.sh`
-  - Windows: `$env:PORT = "9090"; .\start.ps1`
-- **Manual build steps** (all platforms):
+- **Forward runtime flags through launchers:** `./start.sh --wallboard`, `./start.sh --offline --port 9090`, `.\start.ps1 --offline --port 9090`
+- **Manual build steps** (all platforms — remember to build `frontend` before `backend` so `rust-embed` bundles fresh assets):
   ```bash
   cd frontend && npm ci && npm run build && cd ..
   cd backend && cargo build --release && cd ..
   ```
-  Then run `./backend/target/release/aibrainworx-threat-board` (or `.\backend\target\release\aibrainworx-threat-board.exe` on Windows) from the repository root.
 
 ---
 
-## Features
+## Features (v0.2.0)
 
-1. **Open Public Cybersecurity Feeds (Zero API Keys Required):**
-   - **Vulnerability & Exploit Databases:** CISA KEV (Known Exploited Vulnerabilities), NIST NVD CVE 2.0 (7-Day window), GitHub Security Advisories, CIRCL Vulnerability Lookup, Google OSV.dev AI/ML Supply-Chain Watchlist (`langchain`, `torch`, `transformers`, `vllm`, `litellm`, `gradio`, `ray`, `mlflow`, `openai`, `mcp`, `picklescan`), FIRST.org EPSS (global top + CVE batch scoring).
-   - **Network & IOC Telemetry:** SANS ISC INFOCON, SANS ISC Top Attacked Ports, SANS ISC Top Attacking IPs, abuse.ch Feodo Tracker Botnet C2s, OpenPhish Live Phishing URLs, Emerging Threats Compromised IPs.
-   - **Breaking Security News, Advisories & PoCs:** CISA All Advisories, CISA ICS Advisories, BleepingComputer, The Hacker News, Krebs on Security, SecurityWeek, Dark Reading, Exploit-DB PoCs, SANS ISC Handler Diary, Google Project Zero, Microsoft MSRC Updates, Hacker News Security Wire (Algolia).
+1. **Open Public Cybersecurity Feeds + BYO Custom Feeds:**
+   - **Vulnerability & Exploit Databases:** CISA KEV (with due-date SLA countdowns), NIST NVD CVE 2.0, GitHub Security Advisories, CIRCL Vulnerability Lookup, Google OSV.dev AI/ML Supply-Chain Watchlist, FIRST.org EPSS (plus **24h/7d delta & spike tracking**).
+   - **Network & IOC Telemetry:** SANS ISC INFOCON, Top Attacked Ports, Top Attacking IPs, abuse.ch Feodo Botnet C2s, OpenPhish Phishing URLs (defanged), Emerging Threats Compromised IPs.
+   - **Security News & Custom Feeds:** CISA Advisories/ICS, BleepingComputer, The Hacker News, Krebs on Security, SecurityWeek, Dark Reading, Exploit-DB PoCs, SANS ISC Diary, Google Project Zero, Microsoft MSRC, Hacker News Security Wire — plus per-feed enable/disable switches and **BYO Custom Feeds** (`RSS/Atom`, `IOC Text`, `STIX 2.1`, `MISP JSON`).
 
-2. **Hourly Background Ingestion & Real-Time Alerts:**
-   - Runs an immediate concurrent sweep on startup and repeats every **3600 seconds (1 hour)** (configurable `60s`–`86400s` in Rules, or triggered manually with **Scan Now**).
-   - Evaluates unseen CVEs and vulnerability news against configurable watchlist rules and pushes alerts instantaneously over **SSE (`/api/events`)** to the dashboard banner, toast stack, audio chime, and optional browser desktop notifications.
+2. **My Stack — 100% Local SBOM & Lockfile Correlation:**
+   - Drop or paste `CycloneDX`, `SPDX`, `package-lock.json`, `package.json`, `Cargo.lock`, `Cargo.toml`, `requirements.txt`, `pyproject.toml`, `go.mod`, or `pom.xml` plus custom vendor/product watchlists.
+   - Everything parses strictly locally in Rust, flags exposed CVEs across KPIs, Overview alerts, Explorer filters, AI briefs, and webhooks without transmitting your dependency tree anywhere.
 
-3. **Universal AI Provider & Local Model Support (13 Providers):**
-   - **Local Inference (Zero Cloud):** **Built-in Rust Engine** (instant deterministic threat graph), **Ollama** (`/api/tags` live model discovery & `/api/chat`), **LM Studio**, and **llama.cpp / vLLM / SGLang / LocalAI**.
-   - **Cloud & Custom APIs:** **OpenAI**, **Anthropic Claude**, **Google Gemini**, **OpenRouter**, **Groq**, **DeepSeek**, **Mistral AI**, **xAI Grok**, and **Custom OpenAI-Compatible** endpoints.
-   - Includes **Test Connection**, live model discovery, per-CVE **Deep AI Triage** in the Investigation Drawer, and automatic fallback to the Built-in Rust Engine if an endpoint is unreachable.
+3. **SOC Workflow, Exports, Webhooks & Air-Gapped Sync:**
+   - **Analyst Triage & Investigation:** Per-CVE status (`New`, `Investigating`, `Mitigated`, `False Positive`, `Accepted`), notes saved in SQLite WAL, FTS5 search, *What Changed & EPSS Surges* sweep diff panel.
+   - **Enterprise Exports & Bulk IOC Triage:** Single-CVE Markdown/JSON/STIX 2.1 dossiers, formula-safe CSV & STIX 2.1 bundle exports, firewall blocklists (`EDL`, `nftables`, `pf`, `CSV`), SHA-256 verified secret-stripped offline snapshots, and up-to-200 batch IOC lookups with one-click defanged copy.
+   - **Signed Outbound Webhooks:** SSRF-pinned HTTPS delivery to Slack, Discord, Microsoft Teams, or generic JSON endpoints with optional HMAC-SHA256 signatures and masked URL display.
+
+4. **Universal AI Provider & Local Model Support (13 Providers):**
+   - **Local Inference (Zero Cloud):** **Built-in Rust Engine**, **Ollama**, **LM Studio**, and **llama.cpp / vLLM / SGLang / LocalAI**.
+   - **Cloud & Custom APIs:** **OpenAI**, **Anthropic Claude**, **Google Gemini**, **OpenRouter**, **Groq**, **DeepSeek**, **Mistral AI**, **xAI Grok**, and **Custom OpenAI-Compatible** endpoints — guarded by DNS-pinned SSRF checks, opt-in LAN endpoints, optional OS Keychain secret persistence, invisible-Unicode stripping, and Markdown XSS sanitization.
 
 ---
 
@@ -207,37 +223,36 @@ Configurable severity/keyword/KEV alerting rules, live SSE test simulation, ackn
 
 ## How It Was Made
 
-AiBrainWorX AI Threat Board was coded with **Gemini 4 Neon Extra High** in **Orchestrator Mode with Hydrogen** and engineered to feel like a single-binary desktop SOC tool — fast to boot, transparent in its risk math, and completely free of Docker stacks, external databases, or cloud lock-in.
+AiBrainWorX AI Threat Board was engineered with a local-first, security-by-design architecture — compiling the React 19 UI directly into a single native executable powered by Axum 0.8 and embedded SQLite WAL/FTS5.
 
 ```mermaid
 flowchart LR
-    Feeds["25 Open Threat Feeds (NVD, KEV, EPSS, OSV, SANS)"] --> Ingest["Rust Async Ingestor (feeds.rs)"]
-    Ingest --> Engine["Risk & Correlation Engine (analyzer.rs)"]
-    Engine --> Store["Local Store & SSE Stream (store.rs)"]
-    Store --> API["Axum 0.8 Loopback Server (routes.rs)"]
+    Feeds["25+ Open & BYO Feeds"] --> Ingest["Rust SSRF-Pinned Ingestor (feeds.rs)"]
+    SBOM["Local SBOM / Lockfiles"] --> Stack["My Stack Correlator (stack.rs)"]
+    Ingest --> Engine["Risk, KEV SLA & EPSS Delta Engine (analyzer.rs)"]
+    Stack --> Engine
+    Engine --> DB["SQLite WAL + FTS5 Store (storage.rs)"]
+    DB --> API["Axum 0.8 Server + Security Middleware (routes.rs, security.rs)"]
     AI["13 Local & Cloud AI Providers (ai_providers.rs)"] <--> API
-    API --> UI["React 19 + Meta Astryx UI (Recharts 3)"]
+    API --> Hooks["Signed Webhooks / STIX / EDL (webhooks.rs, export.rs)"]
+    API --> UI["Embedded React 19 + Meta Astryx UI (rust-embed)"]
 ```
 
 ### Core Architecture & Stack
-- **AI-Assisted Engineering:** Built end-to-end with **Gemini 4 Neon Extra High** in **Orchestrator Mode with Hydrogen**, spanning the async Rust backend, React 19 + Meta Astryx UI, loopback security hardening, macOS/Linux/Windows launchers, and programmatic launch video production.
-- **Pure Rust Backend (`backend/`):** Built with Rust (`edition 2021`), `axum 0.8`, `tokio`, `reqwest 0.12`, `feed-rs 2`, `serde`, and `tower-http 0.6` (with gzip compression and static SPA hosting).
-  - **Concurrent Feed Ingestion (`backend/src/feeds.rs`):** Polls 25 public JSON APIs, Atom/RSS feeds, plain-text IOC lists, and Google OSV AI/ML batch queries asynchronously on startup and every hour, recording per-feed HTTP status, latency, and record counts.
-  - **Deterministic Correlation & Scoring Engine (`backend/src/analyzer.rs`):** Computes explainable 0–100 composite risk scores from advisory severity, FIRST EPSS 30-day exploitation probability, CISA KEV active-exploitation status, public PoCs, and AI/ML supply-chain exposure — plus MITRE ATT&CK tactic inference and automated 7-day executive posture briefings with zero external LLM required.
-  - **Universal AI Provider Adapter (`backend/src/ai_providers.rs`):** Connects 13 local and cloud model backends (`Built-in Rust Engine`, `Ollama`, `LM Studio`, `llama.cpp / vLLM`, `OpenAI`, `Anthropic Claude`, `Google Gemini`, `OpenRouter`, `Groq`, `DeepSeek`, `Mistral`, `xAI`, and `Custom OpenAI-Compatible`) with live model discovery, connection testing, and automatic fallback to the local Rust engine.
-  - **Local Persistence, Real-Time SSE & Hardening (`backend/src/store.rs`, `routes.rs`, `main.rs`):** Persists normalized telemetry locally to `data/threat_store.json`, streams instant watchlist alerts over Server-Sent Events (`tokio-stream` on `/api/events`), and enforces loopback-only `127.0.0.1` binding, `Host`/`Origin` validation, CSP headers, and memory-only API keys.
-- **React 19 + Meta Astryx Frontend (`frontend/`):** Built with `React 19.1`, `TypeScript 5.8`, `Vite 6`, Meta's `@astryxdesign/core` (`0.7.16`) + `@stylexjs/stylex`, `Recharts 3`, and `lucide-react`.
-  - Styled in `frontend/src/index.css` with a high-contrast obsidian SOC theme and sharp `0px` square geometry across modular views (`OverviewView`, `VulnerabilitiesView`, `NewsIntelView`, `NetworkIocView`, `AiAnalystView`, `AiModelsView`, `FeedsAndAlertsView`, `InvestigationDrawer`, and `TopCommandBar`).
-- **Zero-Dependency Local Packaging:** `Vite` compiles the frontend into `frontend/dist/`, which the native Rust binary serves directly on `http://127.0.0.1:8080`. Cross-platform launcher scripts (`start.sh` for macOS/Linux and `start.ps1` for Windows) detect dependencies, build release artifacts on first run, and launch the server in one command.
-- **Launch Video & Demo Production:** The [YouTube launch video](https://youtu.be/5HoKsq8y_2s) and thumbnail were produced programmatically by capturing live sessions of the running dashboard via headless Chrome/Puppeteer, composing beat-synced animations and HUD overlays with [HyperFrames](https://github.com/heygen-com/hyperframes), and rendering to 1080p H.264/AAC via FFmpeg.
+- **Pure Rust Backend (`backend/`):** Built with Rust (`edition 2021`), `axum 0.8`, `tokio`, `reqwest 0.12`, `rusqlite 0.32` (bundled SQLite WAL + FTS5), `rust-embed 8`, `keyring 3`, `sha2`/`hmac`, `feed-rs 2`, `serde`, and `tower-http 0.6`.
+  - **Security & Keychain Layer (`backend/src/security.rs`):** DNS-pinned outbound SSRF validator (`validate_outbound_url` + IPv4-mapped IPv6 unwrapping + `Policy::none()`), invisible Unicode/bidi/Tag stripper, Markdown XSS/tracking-pixel sanitizer, CSPRNG token & constant-time compare helpers, and optional OS native Keychain integration.
+  - **Embedded SQLite + FTS5 & Migration (`backend/src/storage.rs`):** Persists CVEs, triage states, 14-day EPSS history, and sweep delta snapshots in `data/threat_board.db` (`0600` Unix permissions) and auto-migrates legacy `data/threat_store.json`.
+  - **Local SBOM Correlator (`backend/src/stack.rs`):** Auto-detects and parses 10 SBOM & lockfile formats offline and correlates them across live feeds.
+  - **Webhooks & Exports (`backend/src/webhooks.rs`, `export.rs`):** HMAC-SHA256 signed Slack/Discord/Teams/Generic webhooks (masked URLs), STIX 2.1 bundles, EDL/`nftables`/`pf` blocklists, formula-safe CSVs, Markdown dossiers, and SHA-256 verified offline snapshots.
+- **React 19 + Meta Astryx Frontend (`frontend/`):** Built with `React 19.1`, `TypeScript 5.8`, `Vite 6`, `@astryxdesign/core` (`0.7.16`), `Recharts 3`, and `lucide-react`, including client-side OPSEC redaction & Markdown sanitization (`utils/opsec.ts`) and an optional `VITE_DEMO_MODE=1` static synthetic demo build (`demoData.ts`).
 
 ---
 
 ## Security & API Key Hygiene
 
-- **Localhost Only by Default:** Binds strictly to `127.0.0.1:8080` (`PORT` env var supported), enforces loopback-only `Host` and `Origin` checks against DNS rebinding and cross-site requests, and attaches strict CSP (`frame-ancestors 'none'`) and browser hardening headers. See [SECURITY.md](SECURITY.md) for full details.
-- **Recommended API Key Configuration (Environment Variables):**
-  Export your provider key in the shell before launching the server so credentials never touch disk in `data/threat_store.json`:
+- **Localhost Only by Default:** Binds strictly to `127.0.0.1:8080`, validates `Host` and `Origin` headers against DNS rebinding and CSRF, and attaches strict CSP (`script-src 'self'; img-src 'self' data:; frame-ancestors 'none'`) headers. Binding to non-loopback addresses (`--bind 0.0.0.0`) automatically enforces `AUTH_TOKEN` authentication (`Bearer` or `HttpOnly; SameSite=Strict` cookie). See [SECURITY.md](SECURITY.md) for full details.
+- **Recommended API Key Configuration (Environment Variables or OS Keychain):**
+  Export your provider key in the shell before launching, OR optionally enable OS Keychain storage in **AI Models**:
   - Supported variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `CUSTOM_AI_API_KEY`.
   - macOS / Linux (`bash` / `zsh`):
     ```bash
@@ -249,7 +264,7 @@ flowchart LR
     $env:OPENAI_API_KEY = "your-key-here"
     .\start.ps1
     ```
-- **UI-Entered Keys:** Any key entered directly in the **AI Models** view is kept **in memory only** for the active session and never serialized to `data/threat_store.json`.
+- **Session RAM Default:** Unless OS Keychain opt-in is checked, UI-entered keys stay **in memory only** (`#[serde(skip)]`) and are never serialized to `data/threat_board.db` or offline snapshots.
 - **Zero-Key Local Models:** Install [Ollama](https://ollama.com/) (`ollama serve && ollama pull qwen2.5:14b`) or **LM Studio** locally, then select it inside **AI Models** — no cloud API key needed.
 
 ## License

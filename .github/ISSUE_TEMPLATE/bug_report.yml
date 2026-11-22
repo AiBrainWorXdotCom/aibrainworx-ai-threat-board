@@ -1,0 +1,23 @@
+name: Bug Report
+description: Report a bug or security/UI issue cleanly
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Please describe the bug. Do NOT paste real internal IPs, API keys, or webhook tokens.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version & Environment
+      placeholder: "v0.2.0 / Windows 11 / Docker / macOS"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+    validations:
+      required: true

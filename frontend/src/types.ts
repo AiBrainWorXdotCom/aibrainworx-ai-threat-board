@@ -6,6 +6,8 @@ export interface ScoreFactor {
   detail: string;
 }
 
+export type TriageStatus = 'new' | 'investigating' | 'mitigated' | 'false_positive' | 'accepted';
+
 export interface Vulnerability {
   id: string;
   aliases: string[];
@@ -39,6 +41,13 @@ export interface Vulnerability {
   published_at: string;
   updated_at: string;
   first_seen_at: string;
+  epss_delta_24h?: number | null;
+  epss_delta_7d?: number | null;
+  epss_spike?: boolean;
+  kev_days_remaining?: number | null;
+  matched_stack?: string[];
+  triage_status?: TriageStatus;
+  triage_notes?: string;
 }
 
 export interface ThreatNewsItem {
@@ -195,6 +204,7 @@ export interface DashboardKpis {
   kev_total_catalog: number;
   kev_tracked: number;
   kev_added_7d: number;
+  kev_overdue_count: number;
   high_epss_count: number;
   max_epss_pct: number;
   ai_related_vulns: number;
@@ -207,6 +217,9 @@ export interface DashboardKpis {
   unacknowledged_alerts: number;
   feeds_ok: number;
   feeds_total: number;
+  stack_exposed_count: number;
+  epss_spike_count: number;
+  triage_investigating_count: number;
 }
 
 export type AiProviderKind =
@@ -244,11 +257,15 @@ export interface AiConfigPublic {
   has_api_key: boolean;
   api_key_masked: string;
   env_key_present: boolean;
+  keychain_available: boolean;
+  keychain_has_key: boolean;
   temperature: number;
   max_tokens: number;
   timeout_secs: number;
   system_prompt: string;
   enrich_briefing: boolean;
+  allow_lan_endpoints: boolean;
+  save_key_to_keychain: boolean;
   active_label: string;
   presets: AiProviderPreset[];
 }
@@ -264,6 +281,8 @@ export interface AiConfigUpdate {
   timeout_secs?: number;
   system_prompt?: string;
   enrich_briefing?: boolean;
+  allow_lan_endpoints?: boolean;
+  save_key_to_keychain?: boolean;
 }
 
 export interface AiModelsResponse {
@@ -282,6 +301,174 @@ export interface AiTestResponse {
   error: string | null;
 }
 
+export interface CveTriage {
+  cve_id: string;
+  status: TriageStatus;
+  notes: string;
+  updated_at: string;
+}
+
+export interface StackComponent {
+  name: string;
+  version: string;
+  ecosystem: string;
+  source_file: string;
+}
+
+export interface MyStackConfig {
+  vendors: string[];
+  products: string[];
+  keywords: string[];
+  components: StackComponent[];
+  updated_at: string | null;
+}
+
+export interface MyStackUpdateRequest {
+  vendors?: string[];
+  products?: string[];
+  keywords?: string[];
+  components?: StackComponent[];
+}
+
+export interface StackMatchSummary {
+  configured: boolean;
+  component_count: number;
+  vendor_watch_count: number;
+  matched_vuln_count: number;
+  matched_kev_count: number;
+  top_matched_cves: string[];
+}
+
+export interface MyStackPayload {
+  config: MyStackConfig;
+  summary: StackMatchSummary;
+  matched_vulnerabilities: Vulnerability[];
+}
+
+export interface StackImportResponse {
+  format_detected: string;
+  imported_components: number;
+  total_components: number;
+  matched_vulnerabilities: number;
+  config: MyStackConfig;
+}
+
+export type WebhookKind = 'slack' | 'discord' | 'teams' | 'generic';
+
+export interface WebhookTargetPublic {
+  id: string;
+  name: string;
+  kind: WebhookKind;
+  url_masked: string;
+  enabled: boolean;
+  min_severity: Severity;
+  kev_only: boolean;
+  stack_only: boolean;
+  has_signing_secret: boolean;
+  last_status: string | null;
+  last_sent_at: string | null;
+  failure_count: number;
+}
+
+export interface WebhookCreateRequest {
+  name: string;
+  kind: WebhookKind;
+  url: string;
+  enabled?: boolean;
+  min_severity?: Severity;
+  kev_only?: boolean;
+  stack_only?: boolean;
+  signing_secret?: string;
+}
+
+export interface WebhookUpdateRequest {
+  enabled?: boolean;
+  min_severity?: Severity;
+  kev_only?: boolean;
+  stack_only?: boolean;
+}
+
+export interface WebhookTestResponse {
+  ok: boolean;
+  status_code: number | null;
+  message: string;
+  latency_ms: number;
+}
+
+export type CustomFeedKind = 'rss_atom' | 'ioc_text' | 'stix21' | 'misp_json';
+
+export interface CustomFeedConfig {
+  id: string;
+  name: string;
+  url: string;
+  kind: CustomFeedKind;
+  enabled: boolean;
+  last_status: string | null;
+  last_item_count: number;
+  last_checked: string | null;
+}
+
+export interface CustomFeedCreateRequest {
+  name: string;
+  url: string;
+  kind: CustomFeedKind;
+  enabled?: boolean;
+}
+
+export interface FeedSettings {
+  disabled_feeds: string[];
+  custom_feeds: CustomFeedConfig[];
+}
+
+export interface EpssSpike {
+  cve_id: string;
+  title: string;
+  severity: Severity;
+  current_epss_pct: number;
+  delta_24h_pct: number;
+  is_kev: boolean;
+  matched_stack: string[];
+}
+
+export interface SweepDelta {
+  sweep_at: string;
+  new_cves: string[];
+  new_kevs: string[];
+  new_stack_hits: string[];
+  epss_spikes: EpssSpike[];
+  new_alerts_count: number;
+  reviewed: boolean;
+}
+
+export interface BulkIocResponse {
+  checked: number;
+  matched_count: number;
+  results: IocLookupResult[];
+}
+
+export interface SnapshotImportResult {
+  vulnerabilities_imported: number;
+  news_imported: number;
+  snapshot_exported_at: string;
+  sha256_verified: boolean;
+}
+
+export interface ServerModeInfo {
+  version: string;
+  wallboard_mode: boolean;
+  offline_mode: boolean;
+  auth_required: boolean;
+  authenticated: boolean;
+  bind_addr: string;
+}
+
+export interface AuthStatusResponse {
+  auth_required: boolean;
+  authenticated: boolean;
+  wallboard_mode: boolean;
+  offline_mode: boolean;
+}
+
 export interface DashboardPayload {
   ai_brief: AiThreatBrief;
   kpis: DashboardKpis;
@@ -297,6 +484,10 @@ export interface DashboardPayload {
   total_sweeps: number;
   active_ai_provider: string;
   active_ai_model: string;
+  stack_summary: StackMatchSummary;
+  recent_epss_spikes: EpssSpike[];
+  latest_delta: SweepDelta | null;
+  server_mode: ServerModeInfo;
 }
 
 export interface IocLookupResult {
@@ -339,6 +530,7 @@ export type SseEvent =
 
 export type NavTab =
   | 'overview'
+  | 'mystack'
   | 'vulnerabilities'
   | 'news'
   | 'network'
