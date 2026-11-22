@@ -152,28 +152,33 @@ Open **http://127.0.0.1:8080** in your browser.
 
 ---
 
-## Features (v0.3.0)
+## Features (v0.4.0)
 
-1. **Local Authentication, Hardened Sessions & Offline TOTP 2FA (New in v0.3.0):**
+1. **A2UI 1.0 Interactive SOC Surfaces (New in v0.4.0):**
+   - **Declarative, Zero-HTML Agentic UI (`aibrainworx.soc.v1`):** AI Threat Analyst and per-CVE Deep AI Triage emit validated **A2UI 1.0** `agent_to_renderer` wire envelopes (`createSurface`, `updateDataModel`, `updateComponents`) using RFC 6901 `@path` data bindings — rendering native **Meta Astryx UI** + **Recharts** SOC surfaces instead of static walls of Markdown.
+   - **Intent-Adaptive Interactive Widgets:** Automatically tailors KPI tiles, urgency banners, Recharts risk/port bar charts, OPSEC-aware botnet C2 panels, correlated news cards, checkable **Containment Playbooks** (`X/Y DONE`), and **Interactive Vulnerability Tables** with one-click `Inspect`, live SQLite `Investigate` / `Mitigate` triage actions, and `STIX 2.1` export.
+   - **Strict Catalog & Action Security Boundary:** Both Rust (`backend/src/a2ui.rs`) and React (`frontend/src/components/A2uiRenderer.tsx`) enforce a static component allowlist, cycle/depth/node limits, invisible-Unicode & `javascript:` URI stripping, and a strict non-destructive action allowlist (`open_cve`, `set_triage`, `export_stix`, `export_md`, `navigate_tab`, `copy_text`). Works out of the box with the **Built-in Rust Engine** (`<5 ms`, zero API key), **external LLMs** (Ollama/Gemini/Claude/OpenAI via optional validated `a2ui-patch`), and **Demo Mode** — with a 3-way **Interactive A2UI | Markdown | A2UI JSON** toggle on every response.
+
+2. **Local Authentication, Hardened Sessions & Offline TOTP 2FA (v0.3.0):**
    - **First-Run Local Admin Setup & SOC Login Screen:** Enabled by default on startup — create your local administrator username & passphrase (≥10 characters with live strength meter) in the browser on first launch.
    - **Argon2id + 256-Bit Ephemeral HttpOnly Sessions:** Passwords are hashed locally with OWASP Argon2id parameters (`m=19456, t=2, p=1`, 128-bit CSPRNG salt). Sessions issue random 256-bit `HttpOnly; SameSite=Strict` cookies with only SHA-256 hashes stored in SQLite, progressive brute-force lockout (`429 Retry-After`), active browser session management, and instant server-side revocation on logout or password change.
    - **Offline RFC 6238 TOTP 2FA & Recovery Codes:** Enroll any authenticator app via **100% locally rendered base64 SVG QR codes** (zero external network calls) with replay protection and 8 single-use hashed recovery codes. Includes `--reset-auth` for local CLI recovery and `--no-auth` for loopback-only (`127.0.0.1`) kiosk bypass.
 
-2. **Open Public Cybersecurity Feeds + BYO Custom Feeds:**
+3. **Open Public Cybersecurity Feeds + BYO Custom Feeds:**
    - **Vulnerability & Exploit Databases:** CISA KEV (with due-date SLA countdowns), NIST NVD CVE 2.0, GitHub Security Advisories, CIRCL Vulnerability Lookup, Google OSV.dev AI/ML Supply-Chain Watchlist, FIRST.org EPSS (plus **24h/7d delta & spike tracking**).
    - **Network & IOC Telemetry:** SANS ISC INFOCON, Top Attacked Ports, Top Attacking IPs, abuse.ch Feodo Botnet C2s, OpenPhish Phishing URLs (defanged), Emerging Threats Compromised IPs.
    - **Security News & Custom Feeds:** CISA Advisories/ICS, BleepingComputer, The Hacker News, Krebs on Security, SecurityWeek, Dark Reading, Exploit-DB PoCs, SANS ISC Diary, Google Project Zero, Microsoft MSRC, Hacker News Security Wire — plus per-feed enable/disable switches and **BYO Custom Feeds** (`RSS/Atom`, `IOC Text`, `STIX 2.1`, `MISP JSON`).
 
-3. **My Stack — 100% Local SBOM & Lockfile Correlation:**
+4. **My Stack — 100% Local SBOM & Lockfile Correlation:**
    - Drop or paste `CycloneDX`, `SPDX`, `package-lock.json`, `package.json`, `Cargo.lock`, `Cargo.toml`, `requirements.txt`, `pyproject.toml`, `go.mod`, or `pom.xml` plus custom vendor/product watchlists.
    - Everything parses strictly locally in Rust, flags exposed CVEs across KPIs, Overview alerts, Explorer filters, AI briefs, and webhooks without transmitting your dependency tree anywhere.
 
-4. **SOC Workflow, Exports, Webhooks & Air-Gapped Sync:**
+5. **SOC Workflow, Exports, Webhooks & Air-Gapped Sync:**
    - **Analyst Triage & Investigation:** Per-CVE status (`New`, `Investigating`, `Mitigated`, `False Positive`, `Accepted`), notes saved in SQLite WAL, FTS5 search, *What Changed & EPSS Surges* sweep diff panel.
    - **Enterprise Exports & Bulk IOC Triage:** Single-CVE Markdown/JSON/STIX 2.1 dossiers, formula-safe CSV & STIX 2.1 bundle exports, firewall blocklists (`EDL`, `nftables`, `pf`, `CSV`), SHA-256 verified secret-stripped offline snapshots, and up-to-200 batch IOC lookups with one-click defanged copy.
    - **Signed Outbound Webhooks:** SSRF-pinned HTTPS delivery to Slack, Discord, Microsoft Teams, or generic JSON endpoints with optional HMAC-SHA256 signatures and masked URL display.
 
-5. **Universal AI Provider & Local Model Support (13 Providers):**
+6. **Universal AI Provider & Local Model Support (13 Providers):**
    - **Local Inference (Zero Cloud):** **Built-in Rust Engine**, **Ollama**, **LM Studio**, and **llama.cpp / vLLM / SGLang / LocalAI**.
    - **Cloud & Custom APIs:** **OpenAI**, **Anthropic Claude**, **Google Gemini**, **OpenRouter**, **Groq**, **DeepSeek**, **Mistral AI**, **xAI Grok**, and **Custom OpenAI-Compatible** endpoints — guarded by DNS-pinned SSRF checks, opt-in LAN endpoints, optional OS Keychain secret persistence, invisible-Unicode stripping, and Markdown XSS sanitization.
 
@@ -191,8 +196,8 @@ Correlated 2x2 Recharts analytics tracking 7-day CVE/news/exploit velocity, CVSS
 
 ![Live Threat Analytics Charts](docs/screenshots/02-analytics-charts.png)
 
-### 3. Vulnerability Investigation Drawer & Deep AI Triage
-Slide-over dossier panel inspecting CISA KEV mandates, CVSS/EPSS metrics, explainable AI risk factor weights, correlated news, and on-demand Markdown **Deep AI Triage** generated by your active local or cloud model.
+### 3. Vulnerability Investigation Drawer & A2UI Deep AI Triage
+Slide-over dossier panel inspecting CISA KEV mandates, CVSS/EPSS metrics, explainable AI risk factor weights, correlated news, and on-demand **Deep AI Triage** rendered as a compact interactive **A2UI 1.0** surface (risk attribution chart, checkable remediation steps, and one-click triage/STIX actions) with Markdown toggle.
 
 ![Investigation Drawer Deep AI Triage](docs/screenshots/03-investigation-deep-triage.png)
 
@@ -211,10 +216,10 @@ Instant IPv4, hostname, and phishing domain verifier cross-checking SANS ISC top
 
 ![Network IOCs and OPSEC Redact Mode](docs/screenshots/06-network-iocs.png)
 
-### 7. AI Threat Analyst Console
-Interactive natural-language threat hunting console correlating live CVEs, CISA KEVs, exploit PoCs, and network sensors with clickable cited CVE drilldowns.
+### 7. AI Threat Analyst Console — A2UI 1.0 Interactive SOC Surfaces (v0.4.0)
+Interactive natural-language threat hunting console powered by declarative **A2UI 1.0** (`aibrainworx.soc.v1`) surfaces — rendering live KPI strips, interactive CVE triage tables (`Inspect`, `Investigate`, `Mitigate`, `STIX 2.1`), Recharts risk/port bar charts, checkable Containment Playbooks, OPSEC-safe IOC panels, and a 3-way **Interactive A2UI | Markdown | A2UI JSON** view toggle.
 
-![AI Threat Analyst Console](docs/screenshots/07-ai-threat-analyst.png)
+![AI Threat Analyst A2UI 1.0 Interactive SOC Surface](docs/screenshots/07-ai-threat-analyst.png)
 
 ### 8. Universal AI Provider & Local Model Hub (13 Providers)
 Unified configuration hub supporting local engines (Built-in Rust Engine, Ollama live discovery, LM Studio, llama.cpp/vLLM) and cloud APIs (OpenAI, Anthropic Claude, Google Gemini, OpenRouter, Groq, DeepSeek, Mistral, xAI, Custom OpenAI-Compatible) with connection testing, opt-in OS Keychain storage, and SSRF-protected LAN controls.
@@ -251,18 +256,20 @@ flowchart LR
     Engine --> DB["SQLite WAL + FTS5 Store (storage.rs)"]
     DB --> API["Axum 0.8 Server + Security Middleware (routes.rs, security.rs)"]
     AI["13 Local & Cloud AI Providers (ai_providers.rs)"] <--> API
+    API --> A2UI["A2UI 1.0 Surface Engine & Validator (a2ui.rs)"]
     API --> Hooks["Signed Webhooks / STIX / EDL (webhooks.rs, export.rs)"]
-    API --> UI["Embedded React 19 + Meta Astryx UI (rust-embed)"]
+    A2UI --> UI["Embedded React 19 + A2UI Renderer + Meta Astryx UI (rust-embed)"]
 ```
 
 ### Core Architecture & Stack
 - **Pure Rust Backend (`backend/`):** Built with Rust (`edition 2021`), `axum 0.8`, `tokio`, `reqwest 0.12`, `rusqlite 0.32` (bundled SQLite WAL + FTS5), `rust-embed 8`, `argon2 0.5`, `qrcode 0.14`, `keyring 3`, `sha2`/`sha1`/`hmac`, `feed-rs 2`, `serde`, and `tower-http 0.6`.
+  - **A2UI 1.0 Protocol Engine & Validator (`backend/src/a2ui.rs`):** Emits declarative A2UI 1.0 `agent_to_renderer` surfaces (`createSurface`, `updateDataModel`, `updateComponents`, `@path` JSON Pointer bindings) tailored to query intent, validates optional external-LLM `a2ui-patch` blocks against a strict component/action allowlist, rejects cyclic graphs or unsafe URIs, and guarantees zero raw HTML execution.
   - **Local Authentication & 2FA (`backend/src/auth.rs`):** OWASP Argon2id password hashing (`m=19456, t=2, p=1`), timing-resistant dummy verification, 256-bit CSPRNG `HttpOnly; SameSite=Strict` SQLite sessions (SHA-256 hashed at rest), progressive brute-force lockout (`429 Retry-After`), RFC 6238 TOTP with replay protection, local offline base64 SVG QR generation, and 8 single-use hashed recovery codes.
   - **Security & Keychain Layer (`backend/src/security.rs`):** DNS-pinned outbound SSRF validator (`validate_outbound_url` + IPv4-mapped IPv6 unwrapping + `Policy::none()`), invisible Unicode/bidi/Tag stripper, Markdown XSS/tracking-pixel sanitizer, CSPRNG token & constant-time compare helpers, and optional OS native Keychain integration.
   - **Embedded SQLite + FTS5 & Migration (`backend/src/storage.rs`):** Persists CVEs, triage states, 14-day EPSS history, sweep delta snapshots, and local auth tables (`auth_users`, `auth_sessions`) in `data/threat_board.db` (`0600` Unix permissions) and auto-migrates legacy `data/threat_store.json`.
   - **Local SBOM Correlator (`backend/src/stack.rs`):** Auto-detects and parses 10 SBOM & lockfile formats offline and correlates them across live feeds.
   - **Webhooks & Exports (`backend/src/webhooks.rs`, `export.rs`):** HMAC-SHA256 signed Slack/Discord/Teams/Generic webhooks (masked URLs), STIX 2.1 bundles, EDL/`nftables`/`pf` blocklists, formula-safe CSVs, Markdown dossiers, and SHA-256 verified offline snapshots.
-- **React 19 + Meta Astryx Frontend (`frontend/`):** Built with `React 19.1`, `TypeScript 5.8`, `Vite 6`, `@astryxdesign/core` (`0.7.16`), `Recharts 3`, and `lucide-react`, including client-side OPSEC redaction & Markdown sanitization (`utils/opsec.ts`) and an optional `VITE_DEMO_MODE=1` static synthetic demo build (`demoData.ts`).
+- **React 19 + Meta Astryx Frontend (`frontend/`):** Built with `React 19.1`, `TypeScript 5.8`, `Vite 6`, `@astryxdesign/core` (`0.7.16`), `Recharts 3`, and `lucide-react`, including a zero-dependency A2UI 1.0 catalog renderer (`components/A2uiRenderer.tsx`), client-side OPSEC redaction & Markdown sanitization (`utils/opsec.ts`), and an optional `VITE_DEMO_MODE=1` static synthetic demo build (`demoData.ts`).
 
 ---
 

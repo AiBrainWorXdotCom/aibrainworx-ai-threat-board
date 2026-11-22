@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useToast } from '@astryxdesign/core';
 import { Badge } from '@astryxdesign/core/Badge';
 import { Button } from '@astryxdesign/core/Button';
 import { Drawer, DrawerHeader } from '@astryxdesign/core/Drawer';
@@ -9,33 +10,40 @@ import { ProgressBar } from '@astryxdesign/core/ProgressBar';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { Text } from '@astryxdesign/core/Text';
 import { Timestamp } from '@astryxdesign/core/Timestamp';
-import { Download, ExternalLink, Save, ShieldAlert, Sparkles } from 'lucide-react';
+import { Download, ExternalLink, FileText, LayoutGrid, Save, ShieldAlert, Sparkles } from 'lucide-react';
 import { api, safeExternalUrl, severityBadgeVariant } from '../api';
-import type { AiQueryResponse, ThreatNewsItem, TriageStatus, Vulnerability } from '../types';
+import type { AiQueryResponse, NavTab, ThreatNewsItem, TriageStatus, Vulnerability } from '../types';
 import { sanitizeMarkdownClient } from '../utils/opsec';
+import { A2uiRenderer } from './A2uiRenderer';
 
 interface InvestigationDrawerProps {
   vulnId: string | null;
   initialVuln?: Vulnerability | null;
+  opsecMode?: boolean;
   readOnly?: boolean;
   onClose: () => void;
   onSelectVulnId: (id: string) => void;
+  onNavigate?: (tab: NavTab) => void;
   onTriageUpdated?: () => void;
 }
 
 export function InvestigationDrawer({
   vulnId,
   initialVuln,
+  opsecMode = false,
   readOnly = false,
   onClose,
   onSelectVulnId,
+  onNavigate,
   onTriageUpdated,
 }: InvestigationDrawerProps) {
+  const toast = useToast();
   const [vuln, setVuln] = useState<Vulnerability | null>(initialVuln ?? null);
   const [relatedNews, setRelatedNews] = useState<ThreatNewsItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [deepTriage, setDeepTriage] = useState<AiQueryResponse | null>(null);
+  const [triageViewMode, setTriageViewMode] = useState<'a2ui' | 'markdown'>('a2ui');
   const [triageLoading, setTriageLoading] = useState(false);
 
   const [triageStatus, setTriageStatus] = useState<TriageStatus>('new');
@@ -319,21 +327,76 @@ export function InvestigationDrawer({
                       </Text>
                       {deepTriage && (
                         <div style={{ borderTop: '1px solid var(--soc-border)', paddingTop: 10 }}>
-                          <div className="abw-flex-wrap" style={{ marginBottom: 8 }}>
-                            <Badge
-                              variant="info"
-                              label={`${deepTriage.provider_used} · ${deepTriage.model_used}`}
-                            />
-                            <Badge variant="neutral" label={`${deepTriage.latency_ms} ms`} />
+                          <div
+                            className="abw-flex-wrap"
+                            style={{ justifyContent: 'space-between', marginBottom: 8 }}
+                          >
+                            <div className="abw-flex-wrap">
+                              <Badge
+                                variant="info"
+                                label={`${deepTriage.provider_used} · ${deepTriage.model_used}`}
+                              />
+                              <Badge variant="neutral" label={`${deepTriage.latency_ms} ms`} />
+                            </div>
+                            {deepTriage.a2ui && (
+                              <div className="abw-a2ui-mode-tabs">
+                                <button
+                                  type="button"
+                                  className="abw-a2ui-mode-tab"
+                                  data-active={triageViewMode === 'a2ui'}
+                                  onClick={() => setTriageViewMode('a2ui')}
+                                >
+                                  <LayoutGrid size={11} /> A2UI
+                                </button>
+                                <button
+                                  type="button"
+                                  className="abw-a2ui-mode-tab"
+                                  data-active={triageViewMode === 'markdown'}
+                                  onClick={() => setTriageViewMode('markdown')}
+                                >
+                                  <FileText size={11} /> MD
+                                </button>
+                              </div>
+                            )}
                           </div>
                           {deepTriage.fallback_reason && (
                             <Text type="supporting" size="xsm" display="block" style={{ marginBottom: 6 }}>
                               Fallback reason: {deepTriage.fallback_reason}
                             </Text>
                           )}
-                          <Markdown density="compact">
-                            {sanitizeMarkdownClient(deepTriage.answer_markdown)}
-                          </Markdown>
+                          {deepTriage.a2ui && triageViewMode === 'a2ui' ? (
+                            <A2uiRenderer
+                              surface={deepTriage.a2ui}
+                              opsecMode={opsecMode}
+                              readOnly={readOnly}
+                              compact
+                              onOpenCve={onSelectVulnId}
+                              onNavigate={(tab) => {
+                                onClose();
+                                onNavigate?.(tab);
+                              }}
+                              onTriageUpdated={() => {
+                                onTriageUpdated?.();
+                                if (vuln) {
+                                  void api.getVulnerabilityDetail(vuln.id).then((res) => {
+                                    setVuln(res.vulnerability);
+                                    setTriageStatus(res.vulnerability.triage_status ?? 'new');
+                                    setTriageNotes(res.vulnerability.triage_notes ?? '');
+                                  });
+                                }
+                              }}
+                              onNotify={(msg, tone) =>
+                                toast({
+                                  type: tone === 'error' ? 'error' : 'info',
+                                  body: msg,
+                                })
+                              }
+                            />
+                          ) : (
+                            <Markdown density="compact">
+                              {sanitizeMarkdownClient(deepTriage.answer_markdown)}
+                            </Markdown>
+                          )}
                         </div>
                       )}
                     </div>

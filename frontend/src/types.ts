@@ -547,6 +547,42 @@ export interface IocLookupResult {
   }[];
 }
 
+export interface A2uiComponentNode {
+  id: string;
+  component: string;
+  children?: string[];
+  props?: Record<string, unknown>;
+}
+
+export type A2uiServerMessage =
+  | {
+      type: 'createSurface';
+      surfaceId: string;
+      catalogId: string;
+      rootComponentId: string;
+      title: string;
+      subtitle: string;
+    }
+  | {
+      type: 'updateDataModel';
+      surfaceId: string;
+      path: string;
+      value: unknown;
+    }
+  | {
+      type: 'updateComponents';
+      surfaceId: string;
+      components: A2uiComponentNode[];
+    };
+
+export interface A2uiSurfacePayload {
+  version: string;
+  surface_id: string;
+  catalog_id: string;
+  intent: string;
+  messages: A2uiServerMessage[];
+}
+
 export interface AiQueryResponse {
   answer_markdown: string;
   cited_cves: string[];
@@ -557,6 +593,7 @@ export interface AiQueryResponse {
   model_used: string;
   latency_ms: number;
   fallback_reason: string | null;
+  a2ui?: A2uiSurfacePayload | null;
 }
 
 export type SseEvent =

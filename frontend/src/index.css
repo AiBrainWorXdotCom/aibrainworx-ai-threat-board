@@ -978,3 +978,284 @@ html[data-theme='light'] .abw-score-low {
 .abw-modal-body {
   padding: 16px;
 }
+
+/* ============================================================================
+   A2UI 1.0 Interactive SOC Surfaces
+   ============================================================================ */
+.abw-a2ui-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.abw-a2ui-surface-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: linear-gradient(90deg, rgba(102, 239, 171, 0.09), rgba(56, 189, 248, 0.04));
+  border: 1px solid rgba(102, 239, 171, 0.28);
+  border-left: 3px solid var(--soc-mint, #66efab);
+}
+
+.abw-a2ui-surface-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--soc-text);
+}
+
+.abw-a2ui-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 8px;
+}
+
+.abw-a2ui-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  background: var(--soc-surface);
+  border: 1px solid var(--soc-border);
+  border-top: 2px solid var(--soc-border-strong);
+}
+
+.abw-a2ui-kpi-crit {
+  border-top-color: #ef4444;
+}
+
+.abw-a2ui-kpi-warn {
+  border-top-color: #f97316;
+}
+
+.abw-a2ui-kpi-mint {
+  border-top-color: #66efab;
+}
+
+.abw-a2ui-kpi-cyan {
+  border-top-color: #38bdf8;
+}
+
+.abw-a2ui-kpi-label {
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--soc-text-muted);
+}
+
+.abw-a2ui-kpi-value {
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--soc-text);
+}
+
+.abw-a2ui-kpi-detail {
+  font-size: 11px;
+  color: var(--soc-text-muted);
+}
+
+.abw-a2ui-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 12px;
+}
+
+.abw-a2ui-card {
+  border: 1px solid var(--soc-border-strong);
+  background: var(--soc-surface);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.abw-a2ui-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--soc-border);
+  background: rgba(148, 163, 184, 0.04);
+}
+
+.abw-a2ui-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--soc-text);
+}
+
+.abw-a2ui-card-body {
+  padding: 12px;
+}
+
+.abw-a2ui-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.abw-a2ui-table th {
+  text-align: left;
+  padding: 7px 10px;
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--soc-text-muted);
+  border-bottom: 1px solid var(--soc-border-strong);
+  background: rgba(148, 163, 184, 0.04);
+}
+
+.abw-a2ui-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--soc-border);
+  vertical-align: top;
+}
+
+.abw-a2ui-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.abw-a2ui-table tbody tr:hover {
+  background: rgba(102, 239, 171, 0.035);
+}
+
+.abw-a2ui-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--soc-border);
+  background: var(--soc-panel);
+  transition: border-color 140ms ease, opacity 140ms ease;
+}
+
+.abw-a2ui-step[data-checked='true'] {
+  border-color: rgba(102, 239, 171, 0.35);
+  opacity: 0.78;
+}
+
+.abw-a2ui-step-toggle {
+  background: transparent;
+  border: none;
+  padding: 1px;
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.abw-a2ui-news-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
+
+.abw-a2ui-news-item {
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  border: 1px solid var(--soc-border);
+  background: var(--soc-panel);
+}
+
+.abw-a2ui-ext-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--soc-cyan, #38bdf8);
+  text-decoration: none;
+}
+
+.abw-a2ui-ext-link:hover {
+  text-decoration: underline;
+}
+
+.abw-a2ui-actionbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--soc-border);
+  background: rgba(148, 163, 184, 0.035);
+}
+
+.abw-a2ui-actionbar-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--soc-text-muted);
+}
+
+.abw-a2ui-mode-tabs {
+  display: inline-flex;
+  border: 1px solid var(--soc-border-strong);
+  background: var(--soc-surface);
+  overflow: hidden;
+}
+
+.abw-a2ui-mode-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border: none;
+  border-right: 1px solid var(--soc-border);
+  background: transparent;
+  color: var(--soc-text-muted);
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.abw-a2ui-mode-tab:last-child {
+  border-right: none;
+}
+
+.abw-a2ui-mode-tab[data-active='true'] {
+  background: rgba(102, 239, 171, 0.14);
+  color: var(--soc-text);
+}
+
+.abw-a2ui-json-pre {
+  margin: 0;
+  padding: 12px;
+  max-height: 440px;
+  overflow: auto;
+  background: #06090f;
+  color: #a5f3fc;
+  border: 1px solid var(--soc-border-strong);
+  font-family: var(--font-family-code, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.48;
+  white-space: pre;
+}
+
+html[data-theme='light'] .abw-a2ui-json-pre {
+  background: #0f172a;
+  color: #e2e8f0;
+}

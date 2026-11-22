@@ -1,3 +1,4 @@
+mod a2ui;
 mod ai_providers;
 mod analyzer;
 mod auth;

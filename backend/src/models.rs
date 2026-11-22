@@ -516,6 +516,8 @@ pub struct AiQueryResponse {
     pub model_used: String,
     pub latency_ms: u64,
     pub fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2ui: Option<crate::a2ui::A2uiSurfacePayload>,
 }
 
 #[derive(Debug, Clone, Serialize)]

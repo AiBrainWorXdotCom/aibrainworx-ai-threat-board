@@ -2,6 +2,14 @@
 
 All notable changes to **AiBrainWorX AI CyberSecurity Threat Analysis Board** are documented here.
 
+## v0.4.0 (2026-11-22)
+
+### A2UI 1.0 Interactive SOC Surfaces
+- **Declarative A2UI 1.0 Protocol Engine & Validator (`backend/src/a2ui.rs`):** Emits validated A2UI 1.0 `agent_to_renderer` message envelopes (`createSurface`, `updateDataModel`, `updateComponents`, catalog `aibrainworx.soc.v1`) with RFC 6901 `@path` JSON Pointer data bindings, strict component/action allowlists, cycle/depth/node limits, and invisible-Unicode / dangerous-URI stripping.
+- **Intent-Adaptive SOC Surfaces:** Automatically tailors layouts across CISA KEV & Ransomware, AI/ML Supply-Chain, Network Perimeter & IOCs, Breaking Advisories & PoCs, My Stack Exposure, CVE Deep-Dive, and Threat Overview queries using word-boundary intent classification.
+- **Zero-Bloat React A2UI 1.0 Renderer (`frontend/src/components/A2uiRenderer.tsx`):** Maps allowlisted catalog primitives directly to native Meta Astryx UI + Recharts widgets — KPI strips, urgency banners, interactive CVE triage tables (`Inspect`, live SQLite `Investigate`/`Mitigate`, `STIX 2.1`), risk & port bar charts, checkable Containment Playbooks (`X/Y DONE`), correlated advisory cards, and OPSEC-aware Botnet C2 panels with defanged copy.
+- **AI Threat Analyst & Deep AI Triage Upgrades:** Added 3-way **Interactive A2UI | Markdown | A2UI JSON** mode switching (preserving local checklist/triage state across switches), a **My Stack Exposure** analyst preset prompt, compact A2UI 1.0 Deep Triage surfaces inside `InvestigationDrawer`, optional external-LLM `a2ui-patch` integration with Rust-verified telemetry binding, and full A2UI 1.0 support in `VITE_DEMO_MODE=1` static Demo Mode.
+
 ## v0.3.0 (2026-11-22)
 
 ### Local Authentication, Hardened Sessions & Offline TOTP 2FA

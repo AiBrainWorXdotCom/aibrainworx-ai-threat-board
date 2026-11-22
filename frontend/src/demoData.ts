@@ -993,17 +993,121 @@ export const demoApi = {
 
   updateAiConfig: async (_upd: AiConfigUpdate): Promise<AiConfigPublic> => demoApi.getAiConfig(),
 
-  analyzeQuery: async (query: string): Promise<AiQueryResponse> => ({
-    answer_markdown: `### Demo Threat Analysis — "${query}"\n\n- **CVE-2026-41001** (AI Risk **96/100** · CISA KEV · **Stack Match: openssl**) — Upgrade OpenSSL to **3.0.16**.\n- **CVE-2026-39812** (AI Risk **89/100** · EPSS **+18.9% 24h** · **Stack Match: torch**) — Upgrade PyTorch to **2.6.1**.\n\n*Static GitHub Pages Demo Mode uses pre-seeded sanitized synthetic data. Run the single binary locally for live 25-feed & LLM analysis.*`,
-    cited_cves: ['CVE-2026-41001', 'CVE-2026-39812'],
-    matched_news_count: 2,
-    matched_vuln_count: 2,
-    analysis_mode: 'Built-in Rust Engine (Static Demo)',
-    provider_used: 'Static Demo Simulator',
-    model_used: 'local-threat-graph-v1',
-    latency_ms: 8,
-    fallback_reason: null,
-  }),
+  analyzeQuery: async (query: string): Promise<AiQueryResponse> => {
+    const surfaceId = `demo-surface-${Date.now()}`;
+    const topVulns = demoState.vulns.slice(0, 4);
+    const topNews = demoState.news.slice(0, 2);
+    return {
+      answer_markdown: `### Demo Threat Analysis — "${query}"\n\n- **CVE-2026-41001** (AI Risk **96/100** · CISA KEV · **Stack Match: openssl**) — Upgrade OpenSSL to **3.0.16**.\n- **CVE-2026-39812** (AI Risk **89/100** · EPSS **+18.9% 24h** · **Stack Match: torch**) — Upgrade PyTorch to **2.6.1**.\n\n*Static GitHub Pages Demo Mode uses pre-seeded sanitized synthetic data. Run the single binary locally for live 25-feed & LLM analysis.*`,
+      cited_cves: topVulns.map((v) => v.id),
+      matched_news_count: topNews.length,
+      matched_vuln_count: topVulns.length,
+      analysis_mode: 'Built-in Rust Engine (Static Demo)',
+      provider_used: 'Static Demo Simulator',
+      model_used: 'local-threat-graph-v1',
+      latency_ms: 8,
+      fallback_reason: null,
+      a2ui: {
+        version: '1.0',
+        surface_id: surfaceId,
+        catalog_id: 'aibrainworx.soc.v1',
+        intent: 'threat_overview',
+        messages: [
+          {
+            type: 'createSurface',
+            surfaceId,
+            catalogId: 'aibrainworx.soc.v1',
+            rootComponentId: 'root',
+            title: 'Interactive Threat Posture Surface (Demo)',
+            subtitle: `Query: "${query.slice(0, 68)}" · Synthetic sanitized SOC simulation`,
+          },
+          {
+            type: 'updateDataModel',
+            surfaceId,
+            path: '/',
+            value: {
+              kpis: [
+                { label: 'THREAT INDEX', value: '82/100', detail: 'CRITICAL (Demo)', tone: 'crit' },
+                { label: 'MATCHED CVEs', value: String(topVulns.length), detail: '2 KEV · 2 Stack hits', tone: 'crit' },
+                { label: 'PEAK EPSS (30D)', value: '91.4%', detail: 'CVE-2026-41001 (+24.6% 24h)', tone: 'warn' },
+                { label: 'CORRELATED INTEL', value: String(topNews.length), detail: '4/4 demo feeds OK', tone: 'mint' },
+              ],
+              chart: {
+                series: topVulns.map((v) => ({
+                  name: v.id,
+                  value: v.ai_risk_score,
+                  detail: `${v.vendor ?? ''} ${v.product ?? ''} · EPSS ${((v.epss_score ?? 0) * 100).toFixed(1)}%`.trim(),
+                })),
+              },
+              vulns: topVulns.map((v) => ({
+                id: v.id,
+                title: v.title,
+                target: `${v.vendor ?? ''} ${v.product ?? ''}`.trim() || 'Demo Package',
+                severity: v.severity,
+                aiRisk: v.ai_risk_score,
+                cvss: v.cvss_score,
+                epssPct: v.epss_score != null ? Number((v.epss_score * 100).toFixed(1)) : null,
+                isKev: v.is_kev,
+                kevDaysRemaining: v.kev_days_remaining ?? null,
+                ransomware: v.ransomware_use,
+                isAi: v.is_ai_related,
+                hasExploit: v.has_public_exploit,
+                matchedStack: v.matched_stack ?? [],
+                triageStatus: v.triage_status ?? 'new',
+              })),
+              playbook: [
+                {
+                  id: 'demo-p0',
+                  priority: 'P0',
+                  title: 'Patch CVE-2026-41001 (OpenSSL 3.0.16) before CISA KEV deadline',
+                  detail: 'Matched local SBOM component openssl with +24.6% 24h EPSS surge.',
+                  action: { type: 'open_cve', label: 'Inspect CVE-2026-41001', cveId: 'CVE-2026-41001' },
+                },
+                {
+                  id: 'demo-p1',
+                  priority: 'P1',
+                  title: 'Upgrade PyTorch to 2.6.1 & disable untrusted pickle loading',
+                  detail: 'Mitigates CVE-2026-39812 AI/ML supply-chain deserialization RCE.',
+                  action: { type: 'navigate_tab', label: 'Open My Stack', tab: 'mystack' },
+                },
+                {
+                  id: 'demo-p2',
+                  priority: 'P2',
+                  title: 'Export STIX 2.1 dossier for SIEM / SOAR correlation',
+                  detail: 'Share structured threat intelligence across response teams.',
+                  action: { type: 'export_stix', label: 'Export STIX 2.1', cveId: 'CVE-2026-41001' },
+                },
+              ],
+            },
+          },
+          {
+            type: 'updateComponents',
+            surfaceId,
+            components: [
+              { id: 'root', component: 'Column', children: ['kpi-strip', 'vuln-table', 'split-mid', 'quick-actions'] },
+              { id: 'kpi-strip', component: 'KpiStrip', props: { items: { '@path': '/kpis' } } },
+              { id: 'vuln-table', component: 'VulnTable', props: { title: 'Priority Vulnerabilities (Interactive Triage)', rows: { '@path': '/vulns' } } },
+              { id: 'split-mid', component: 'SplitGrid', children: ['primary-chart', 'remediation-playbook'] },
+              { id: 'primary-chart', component: 'BarChart', props: { title: 'Priority CVE Risk Profile', subtitle: 'AI Risk Score (0–100)', unit: 'pts', accent: 'mint', data: { '@path': '/chart/series' } } },
+              { id: 'remediation-playbook', component: 'ActionChecklist', props: { title: 'Recommended Containment Playbook', items: { '@path': '/playbook' } } },
+              {
+                id: 'quick-actions',
+                component: 'ActionBar',
+                props: {
+                  actions: [
+                    { type: 'export_stix', label: 'Export CVE-2026-41001 STIX 2.1', cveId: 'CVE-2026-41001' },
+                    { type: 'navigate_tab', label: 'All Vulnerabilities', tab: 'vulnerabilities' },
+                    { type: 'navigate_tab', label: 'My Stack Exposure', tab: 'mystack' },
+                    { type: 'navigate_tab', label: 'Network IOCs', tab: 'network' },
+                  ],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    };
+  },
 
   importSnapshot: async (): Promise<SnapshotImportResult> => ({
     vulnerabilities_imported: demoState.vulns.length,

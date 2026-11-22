@@ -525,8 +525,11 @@ function DashboardWorkspace({
                 <AiAnalystView
                   activeProvider={dashboard.active_ai_provider}
                   activeModel={dashboard.active_ai_model}
+                  opsecMode={opsecMode}
                   readOnly={serverWallboard}
                   onSelectVulnId={handleSelectVulnId}
+                  onNavigate={setActiveTab}
+                  onTriageUpdated={() => void loadDashboard()}
                   onOpenAiModels={() => setActiveTab('models')}
                 />
               )}
@@ -558,12 +561,14 @@ function DashboardWorkspace({
       <InvestigationDrawer
         vulnId={drawerVulnId}
         initialVuln={drawerInitialVuln}
+        opsecMode={opsecMode}
         readOnly={serverWallboard}
         onClose={() => {
           setDrawerVulnId(null);
           setDrawerInitialVuln(null);
         }}
         onSelectVulnId={handleSelectVulnId}
+        onNavigate={setActiveTab}
         onTriageUpdated={() => void loadDashboard()}
       />
 

@@ -1111,26 +1111,37 @@ pub async fn answer_analyst_query(
         .map(|s| s.to_string())
         .collect();
 
-    let wants_week =
-        q_lower.contains("week") || q_lower.contains("7 day") || q_lower.contains("7d");
-    let wants_ai = q_lower.contains("ai")
-        || q_lower.contains("llm")
+    let has_tok = |word: &str| {
+        q_lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == word)
+    };
+    let wants_week = q_lower.contains("week") || q_lower.contains("7 day") || has_tok("7d");
+    let wants_ai = has_tok("ai")
+        || has_tok("llm")
+        || has_tok("llms")
         || q_lower.contains("langchain")
         || q_lower.contains("pytorch")
-        || q_lower.contains("mcp")
-        || q_lower.contains("model");
-    let wants_kev = q_lower.contains("kev")
+        || has_tok("mcp")
+        || q_lower.contains("vllm")
+        || has_tok("model");
+    let wants_kev = has_tok("kev")
+        || has_tok("kevs")
         || q_lower.contains("exploited")
-        || q_lower.contains("cisa")
+        || has_tok("cisa")
         || q_lower.contains("zero-day")
         || q_lower.contains("0-day");
     let wants_ransomware = q_lower.contains("ransomware");
-    let wants_network = q_lower.contains("port")
+    let wants_stack = q_lower.contains("stack") || has_tok("sbom") || q_lower.contains("inventory");
+    let wants_network = has_tok("port")
+        || has_tok("ports")
         || q_lower.contains("botnet")
-        || q_lower.contains("c2")
+        || has_tok("c2")
+        || has_tok("c2s")
         || q_lower.contains("phish")
-        || q_lower.contains("ip")
-        || q_lower.contains("network");
+        || has_tok("ip")
+        || has_tok("ips")
+        || has_tok("network");
 
     // Score matching vulnerabilities
     let mut scored_vulns: Vec<(i32, &Vulnerability)> = store
@@ -1169,6 +1180,9 @@ pub async fn answer_analyst_query(
             }
             if wants_ransomware && v.ransomware_use {
                 s += 45;
+            }
+            if wants_stack && !v.matched_stack.is_empty() {
+                s += 80;
             }
             if wants_week && (now - v.published_at).num_days() <= 7 {
                 s += 20;
@@ -1254,7 +1268,12 @@ pub async fn answer_analyst_query(
 
     if cfg.provider != AiProviderKind::Builtin {
         let context = wrap_untrusted_telemetry(&build_live_context(store, &top_vulns, &top_news));
-        let guarded_system = format!("{}\n\n{}", cfg.system_prompt, PROMPT_INJECTION_GUARD);
+        let guarded_system = format!(
+            "{}\n\n{}\n\n{}",
+            cfg.system_prompt,
+            PROMPT_INJECTION_GUARD,
+            crate::a2ui::EXTERNAL_LLM_A2UI_HINT
+        );
         let user_prompt = format!(
             "LIVE TELEMETRY CONTEXT:\n{}\n\nANALYST QUESTION:\n{}",
             context, q_clean
@@ -1263,8 +1282,19 @@ pub async fn answer_analyst_query(
             Ok((llm_md, latency_ms)) => {
                 let p_name = provider_display_name(cfg.provider).to_string();
                 let m_name = effective_model(cfg);
+                let (surface, cleaned_md) = crate::a2ui::build_analyst_a2ui_surface(
+                    q_clean,
+                    &query_cves,
+                    store,
+                    &top_vulns,
+                    &top_news,
+                    matched_vuln_count,
+                    matched_news_count,
+                    Some(&llm_md),
+                    now,
+                );
                 return AiQueryResponse {
-                    answer_markdown: sanitize_llm_markdown(&llm_md),
+                    answer_markdown: cleaned_md.unwrap_or_else(|| sanitize_llm_markdown(&llm_md)),
                     cited_cves,
                     matched_news_count,
                     matched_vuln_count,
@@ -1273,6 +1303,7 @@ pub async fn answer_analyst_query(
                     model_used: m_name,
                     latency_ms,
                     fallback_reason: None,
+                    a2ui: Some(surface),
                 };
             }
             Err(err) => {
@@ -1416,6 +1447,18 @@ pub async fn answer_analyst_query(
     md.push_str("2. **Verify AI/ML & OSS Dependencies** (PyTorch, LangChain, vLLM, MCP servers) against patched versions shown in the Investigation Drawer.\n");
     md.push_str("3. **Block Active Botnet C2 & Compromised IPs** in the Network IOCs tab at perimeter firewalls/EDRs.\n");
 
+    let (surface, _) = crate::a2ui::build_analyst_a2ui_surface(
+        q_clean,
+        &query_cves,
+        store,
+        &top_vulns,
+        &top_news,
+        matched_vuln_count,
+        matched_news_count,
+        None,
+        now,
+    );
+
     AiQueryResponse {
         answer_markdown: md,
         cited_cves,
@@ -1426,6 +1469,7 @@ pub async fn answer_analyst_query(
         model_used: "local-threat-graph-v1".to_string(),
         latency_ms: t0.elapsed().as_millis() as u64,
         fallback_reason,
+        a2ui: Some(surface),
     }
 }
 
@@ -1519,8 +1563,15 @@ pub async fn triage_vulnerability_with_ai(
             Ok((answer_markdown, latency_ms)) => {
                 let p_name = provider_display_name(cfg.provider).to_string();
                 let m_name = effective_model(cfg);
+                let sanitized = sanitize_llm_markdown(&answer_markdown);
+                let surface = crate::a2ui::build_vuln_triage_a2ui_surface(
+                    vuln,
+                    &related_news,
+                    Some(&sanitized),
+                    Utc::now(),
+                );
                 return Ok(AiQueryResponse {
-                    answer_markdown: sanitize_llm_markdown(&answer_markdown),
+                    answer_markdown: sanitized,
                     cited_cves,
                     matched_news_count: related_news.len(),
                     matched_vuln_count: 1,
@@ -1529,6 +1580,7 @@ pub async fn triage_vulnerability_with_ai(
                     model_used: m_name,
                     latency_ms,
                     fallback_reason: None,
+                    a2ui: Some(surface),
                 });
             }
             Err(err) => {
@@ -1593,6 +1645,9 @@ pub async fn triage_vulnerability_with_ai(
         md.push_str("- **AI/ML Supply-Chain Check:** Audit model-loading pipelines, untrusted deserialization (pickle), and MCP/agent dependency locks.\n");
     }
 
+    let surface =
+        crate::a2ui::build_vuln_triage_a2ui_surface(vuln, &related_news, None, Utc::now());
+
     Ok(AiQueryResponse {
         answer_markdown: md,
         cited_cves,
@@ -1603,6 +1658,7 @@ pub async fn triage_vulnerability_with_ai(
         model_used: "local-threat-graph-v1".to_string(),
         latency_ms: t0.elapsed().as_millis() as u64,
         fallback_reason,
+        a2ui: Some(surface),
     })
 }
 

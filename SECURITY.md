@@ -2,7 +2,7 @@
 
 ## Threat Model & Local-First Posture
 
-**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.3.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, SSRF containment, credential isolation, and untrusted telemetry sanitization:
+**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.4.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, declarative zero-HTML agentic UI, SSRF containment, credential isolation, and untrusted telemetry sanitization:
 
 1. **Local Argon2id Authentication, Ephemeral Sessions & Offline TOTP 2FA:**
    - Authentication is enabled by default even on `127.0.0.1:8080`. On first run, the browser opens the **First-Run Admin Setup** wizard (`POST /api/auth/setup`, permanently locked with `403` once an account exists).
@@ -31,7 +31,13 @@
    - Both Rust backend and React frontend sanitize returned Markdown before display: blocking `<script>`, `<iframe>`, `<svg>`, remote Markdown images (`![alt](url)` tracking pixels), and non-`http(s)` URI schemes (`javascript:`, `data:`, `file:`).
    - Strict `Content-Security-Policy` headers (`script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'`) and `Cache-Control: no-store` protect sensitive endpoints and `index.html`.
 
-6. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
+6. **A2UI 1.0 Declarative UI Security Boundary (`aibrainworx.soc.v1`):**
+   - **Zero Raw HTML / Zero Code Execution:** AI Threat Analyst and Deep AI Triage emit declarative A2UI 1.0 JSON envelopes (`createSurface`, `updateDataModel`, `updateComponents`, `@path` bindings) rather than executable markup. Both `backend/src/a2ui.rs` and `frontend/src/components/A2uiRenderer.tsx` enforce a static component allowlist — unknown or unapproved component types are dropped silently.
+   - **Strict Non-Destructive Action Allowlist:** Client-side actions dispatched from A2UI surfaces are restricted to `open_cve`, `set_triage` (disabled in `--wallboard` read-only mode), `export_stix`, `export_md`, `navigate_tab`, and `copy_text`. AI-emitted UI actions can never access authentication/2FA, API keys, webhooks, alert rules, or arbitrary outbound URLs.
+   - **Anti-DoS & Sanitization:** `validate_and_sanitize_a2ui` enforces protocol version (`1.0`), trusted catalog ID (`aibrainworx.soc.v1`), maximum component count (`40`), recursion depth (`8`), acyclic component graph verification, invisible-Unicode stripping, and `javascript:`/`data:`/`vbscript:` URI blocking. External LLMs may only supply validated `a2ui-patch` text/playbook hints while all CVE and network metrics stay Rust-verified in `dataModel`.
+   - **OPSEC Parity:** `A2uiRenderer` honors **OPSEC Redact Mode** across KPI subtitles, banners, advisories, botnet C2 IPs/hostnames, copy actions, and raw `A2UI JSON` previews.
+
+7. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
    - **OPSEC Redact Mode** masks public attacker IPs, C2 endpoints, and phishing domains in the UI for safe screen-sharing and demos.
    - Phishing URLs render defanged (`hxxps://`, `[.]`) as non-clickable text.
    - Spreadsheet CSV exports escape leading `=`, `+`, `-`, `@`, `\t`, and `\r` characters to neutralize formula injection.
