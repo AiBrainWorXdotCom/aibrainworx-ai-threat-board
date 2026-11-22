@@ -1,15 +1,15 @@
 # AiBrainWorX — AI CyberSecurity Threat Analysis Board
 
-[![Watch Launch Video on YouTube](https://img.shields.io/badge/YouTube-Watch_Launch_Video-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtu.be/5HoKsq8y_2s)
+[![Watch Launch Video on YouTube](https://img.shields.io/badge/YouTube-Watch_v0.2.0_Launch_Video-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=GVmWoFoDenw)
 [![Interactive Demo](https://img.shields.io/badge/Live_Demo-GitHub_Pages_(Synthetic)-66efab?style=for-the-badge&logo=github)](https://aibrainworxdotcom.github.io/aibrainworx-ai-threat-board/)
 [![CI](https://img.shields.io/github/actions/workflow/status/AiBrainWorXdotCom/aibrainworx-ai-threat-board/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/AiBrainWorXdotCom/aibrainworx-ai-threat-board/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](LICENSE)
 
 **An open-source (MIT), local-first, security-hardened SOC & threat-intelligence correlation dashboard packaged as a single executable binary (Rust + SQLite WAL + React 19).**
 
-[![Watch the AiBrainWorX AI Threat Board Launch Video on YouTube](docs/screenshots/youtube-thumbnail.png)](https://youtu.be/5HoKsq8y_2s)
+[![Watch the AiBrainWorX v0.2.0 AI Threat Board Launch Video on YouTube](docs/screenshots/youtube-thumbnail.png)](https://www.youtube.com/watch?v=GVmWoFoDenw)
 
-> **▶ [Watch the Launch Video & Live App Walkthrough on YouTube](https://youtu.be/5HoKsq8y_2s)**
+> **▶ [Watch the v0.2.0 Launch Video & Live App Walkthrough on YouTube](https://www.youtube.com/watch?v=GVmWoFoDenw)**
 
 ---
 
@@ -17,7 +17,7 @@
 
 AiBrainWorX CyberSecurity Threat Analysis Board was created in response to recent high-velocity cybersecurity headlines — widespread edge and perimeter zero-days, escalating ransomware campaigns, rapid CISA KEV additions, and an emerging wave of vulnerabilities targeting AI/LLM infrastructure (`PyTorch`, `LangChain`, `vLLM`, `LiteLLM`, `Gradio`, `Ray`, `MCP` servers, and unsafe model serialization). Security engineers, developers, and researchers often have to piece together fragmented advisories across NVD, KEV, EPSS, GitHub, Exploit-DB, IOC blocklists, and breaking security wires just to answer one question: *what matters right now, and how exposed is our stack?*
 
-We built this board to consolidate those public intelligence streams into one crisp, zero-lock-in workspace that runs completely locally on **macOS, Linux, and Windows** — with a zero-dependency Rust risk-scoring and correlation engine out of the box, plus optional bring-your-own local LLM (`Ollama`, `LM Studio`, `llama.cpp`, `vLLM`) or cloud AI provider support. See the live dashboard, deep AI triage, and IOC checker in action in the **[YouTube launch video](https://youtu.be/5HoKsq8y_2s)**. It is released as **open source under the [MIT License](LICENSE)** so any team or defender can audit, extend, and self-host it freely.
+We built this board to consolidate those public intelligence streams into one crisp, zero-lock-in workspace that runs completely locally on **macOS, Linux, and Windows** — with a zero-dependency Rust risk-scoring and correlation engine out of the box, plus optional bring-your-own local LLM (`Ollama`, `LM Studio`, `llama.cpp`, `vLLM`) or cloud AI provider support. See the live dashboard, local SBOM correlator, deep AI triage, OPSEC Redact Mode, and IOC checker in action in the **[v0.2.0 YouTube launch video](https://www.youtube.com/watch?v=GVmWoFoDenw)**. It is released as **open source under the [MIT License](LICENSE)** so any team or defender can audit, extend, and self-host it freely.
 
 ---
 
