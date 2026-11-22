@@ -1052,12 +1052,21 @@ async fn list_news(
 
     list.sort_by_key(|a| std::cmp::Reverse(a.published_at));
 
+    let sources: Vec<String> = store
+        .news
+        .values()
+        .map(|n| n.source.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     let total_matched = list.len();
     let limit = params.limit.unwrap_or(180).min(400);
     list.truncate(limit);
 
     Json(serde_json::json!({
         "total_matched": total_matched,
+        "sources": sources,
         "items": list
     }))
 }

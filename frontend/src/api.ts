@@ -202,7 +202,21 @@ export const api = {
   getNews: async (params: Record<string, string | number | boolean | undefined>) => {
     if (IS_DEMO_MODE) {
       const dash = await demoApi.getDashboard();
-      return { total_matched: dash.recent_news.length, sources: [], items: dash.recent_news };
+      const q = String(params.q || '').trim().toLowerCase();
+      const cat = String(params.category || 'ALL');
+      const src = String(params.source || 'ALL');
+      const filtered = dash.recent_news.filter((n) => {
+        if (cat !== 'ALL' && n.category.toLowerCase() !== cat.toLowerCase()) return false;
+        if (src !== 'ALL' && n.source.toLowerCase() !== src.toLowerCase()) return false;
+        if (params.vuln_only && !n.is_vulnerability_news) return false;
+        if (params.ai_only && !n.is_ai_related) return false;
+        if (q && !`${n.title} ${n.summary} ${n.source} ${n.extracted_cves.join(' ')}`.toLowerCase().includes(q)) {
+          return false;
+        }
+        return true;
+      });
+      const sources = Array.from(new Set(dash.recent_news.map((n) => n.source))).sort();
+      return { total_matched: filtered.length, sources, items: filtered };
     }
     const qs = new URLSearchParams();
     Object.entries(params).forEach(([k, v]) => {

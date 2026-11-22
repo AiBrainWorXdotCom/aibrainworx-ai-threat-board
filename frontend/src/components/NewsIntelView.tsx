@@ -38,9 +38,9 @@ export function NewsIntelView({ onSelectVulnId }: NewsIntelViewProps) {
           limit: 150,
         })
         .then((res) => {
-          setItems(res.items);
-          setSources(res.sources);
-          setTotalMatched(res.total_matched);
+          setItems(res.items ?? []);
+          setSources(res.sources ?? []);
+          setTotalMatched(res.total_matched ?? 0);
         })
         .finally(() => setLoading(false));
     }, 180);
