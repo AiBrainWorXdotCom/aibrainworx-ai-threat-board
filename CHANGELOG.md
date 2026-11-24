@@ -2,6 +2,15 @@
 
 All notable changes to **AiBrainWorX AI CyberSecurity Threat Analysis Board** are documented here.
 
+## v0.6.0 (2026-11-23)
+
+### Optional BYO CTI Enrichment Hub, Private OTX Pulse Sync & 24h SQLite Cache
+- **Optional 4-Provider CTI Enrichment Engine (`backend/src/cti.rs`):** Added opt-in on-demand indicator enrichment across **AlienVault / LevelBlue OTX**, **GreyNoise Community** (works out of the box with no API key, plus optional key for higher limits), **AbuseIPDB v2**, and **VirusTotal v3** — zero sign-ups required unless you explicitly configure a key.
+- **Hard Privacy Guard & DNS-Pinned HTTPS:** Automatically refuses to send RFC1918 private IPs, loopback, link-local, CGNAT, ULA, or `.local` / `.internal` / `.lan` / `.home` / `.corp` / `.arpa` / `.invalid` hostnames to any external CTI API (`400 Bad Request`). Every provider call uses DNS-pinned, zero-redirect `https://` (`build_pinned_http_client`) and `#[serde(skip)]` keys stored in session RAM by default (or optional OS Keychain via `keyring` v3).
+- **Private Local OTX Subscribed Pulse Sync:** Syncs your subscribed AlienVault/LevelBlue OTX pulses into local SQLite (`otx_pulses`, capped at `15,000` indicators per pulse) with optional hourly auto-sync during feed sweeps — automatically correlating **Network IOC Verifier** lookups and **Wireshark `.pcap`/`.pcapng`** captures locally without extra API calls.
+- **24-Hour SQLite Enrichment Cache (`cti_enrichment_cache`):** Caches external provider lookup results in local SQLite (auto-pruned at 500 entries, excluded from secret-stripped snapshots) so repeat IOC lookups return instantaneously with a **`SQLITE CACHED (24H)`** badge without burning daily API quotas — with **`Force Refresh`** and **`Clear Cache`** controls.
+- **Feeds & Alerts Hub + Inline Network IOC Enrichment UI (`frontend/src/components/CtiEnrichmentHub.tsx`):** Added the 4-provider configuration/test hub inside **Feeds & Alerts** and one-click **`Enrich (OTX / GN / VT)`** buttons across the IOC Verifier, Wireshark PCAP Flagged Hits, Top External Talkers, and Feodo Botnet C2 tables with full **OPSEC Redact Mode** and **Demo Mode** parity.
+
 ## v0.5.0 (2026-11-22)
 
 ### Wireshark Offline `.pcap` / `.pcapng` Threat Triage & Display Filters

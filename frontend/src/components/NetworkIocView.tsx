@@ -10,19 +10,23 @@ import {
   Bot,
   Copy,
   Download,
+  ExternalLink,
   EyeOff,
   FileCode2,
   Filter,
   Globe,
   Network,
+  RefreshCw,
   Search,
   ShieldAlert,
+  Sparkles,
   Trash2,
   Upload,
 } from 'lucide-react';
-import { api, severityBadgeVariant } from '../api';
+import { api, safeExternalUrl, severityBadgeVariant } from '../api';
 import type {
   BulkIocResponse,
+  CtiEnrichmentResponse,
   IocLookupResult,
   NavTab,
   NetworkTelemetry,
@@ -64,6 +68,11 @@ export function NetworkIocView({
   const [iocQuery, setIocQuery] = useState('');
   const [lookupResult, setLookupResult] = useState<IocLookupResult | null>(null);
   const [checking, setChecking] = useState(false);
+
+  const [ctiResult, setCtiResult] = useState<CtiEnrichmentResponse | null>(null);
+  const [ctiLoading, setCtiLoading] = useState(false);
+  const [ctiError, setCtiError] = useState<string | null>(null);
+  const ctiPanelRef = useRef<HTMLDivElement | null>(null);
 
   const [bulkInput, setBulkInput] = useState('');
   const [bulkResult, setBulkResult] = useState<BulkIocResponse | null>(null);
@@ -151,6 +160,40 @@ export function NetworkIocView({
       setLookupResult(res.lookup_result);
     } finally {
       setChecking(false);
+    }
+  };
+
+  const runCtiEnrich = async (override?: string, forceRefresh = false) => {
+    const q = (override ?? iocQuery).trim();
+    if (!q || ctiLoading || readOnly) return;
+    if (override) {
+      setIocQuery(
+        opsecMode
+          ? /^\d{1,3}(\.\d{1,3}){3}$/.test(override)
+            ? redactIp(override)
+            : redactHostname(override)
+          : override
+      );
+    }
+    setCtiLoading(true);
+    setCtiError(null);
+    try {
+      const res = await api.enrichIndicator(q, forceRefresh);
+      setCtiResult(res);
+      notify(
+        `${res.overall_verdict}: ${res.findings.length} provider finding(s)${res.cached ? ' (SQLite 24h cache)' : ''}`
+      );
+      setTimeout(() => {
+        ctiPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }, 60);
+    } catch (err) {
+      setCtiError(err instanceof Error ? err.message : String(err));
+      setCtiResult(null);
+      setTimeout(() => {
+        ctiPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }, 60);
+    } finally {
+      setCtiLoading(false);
     }
   };
 
@@ -277,6 +320,14 @@ export function NetworkIocView({
               isLoading={checking}
               onClick={() => void runLookup()}
             />
+            <Button
+              label="Enrich (OTX / GN / VT)"
+              variant="secondary"
+              icon={<Sparkles size={13} />}
+              isLoading={ctiLoading}
+              isDisabled={readOnly}
+              onClick={() => void runCtiEnrich()}
+            />
             {telemetry.top_attacking_ips[0] && (
               <Button
                 label={`Sample Top Attacker (${displayIp(telemetry.top_attacking_ips[0].ip)})`}
@@ -336,6 +387,142 @@ export function NetworkIocView({
               )}
             </div>
           )}
+
+          {/* Optional BYO CTI On-Demand Enrichment Results (24h SQLite Cached) */}
+          <div ref={ctiPanelRef}>
+            {ctiError && (
+              <div
+                className="abw-alert-bar"
+                style={{
+                  borderColor: 'rgba(245, 158, 11, 0.5)',
+                  borderLeftColor: '#f59e0b',
+                  background: 'rgba(245, 158, 11, 0.08)',
+                }}
+              >
+                <div style={{ flex: 1 }}>
+                  <Text size="xsm" display="block">
+                    {ctiError}
+                  </Text>
+                </div>
+                {onNavigate && (
+                  <Button
+                    label="Configure OTX / GN / VT"
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => onNavigate('alerts')}
+                  />
+                )}
+              </div>
+            )}
+
+            {ctiResult && (
+              <section className="abw-a2ui-card" style={{ marginTop: 4 }}>
+                <div className="abw-a2ui-card-head">
+                  <div className="abw-flex-wrap">
+                    <Sparkles size={13} color="#66efab" />
+                    <span className="abw-a2ui-card-title">
+                      BYO CTI Enrichment:{' '}
+                      {opsecMode
+                        ? ctiResult.indicator_type === 'ipv4' || ctiResult.indicator_type === 'ipv6'
+                          ? redactIp(ctiResult.indicator)
+                          : ctiResult.indicator_type === 'domain'
+                            ? redactHostname(ctiResult.indicator)
+                            : `${ctiResult.indicator.slice(0, 10)}••••`
+                        : defangIp(ctiResult.indicator)}
+                    </span>
+                    <Badge
+                      variant={
+                        ctiResult.overall_verdict === 'MALICIOUS'
+                          ? 'error'
+                          : ctiResult.overall_verdict === 'SUSPICIOUS'
+                            ? 'orange'
+                            : ctiResult.overall_verdict.startsWith('BENIGN')
+                              ? 'success'
+                              : 'neutral'
+                      }
+                      label={ctiResult.overall_verdict}
+                    />
+                    <Badge
+                      variant={ctiResult.cached ? 'cyan' : 'info'}
+                      label={ctiResult.cached ? 'SQLITE CACHED (24H)' : 'LIVE LOOKUP · SAVED'}
+                    />
+                  </div>
+                  <div className="abw-flex-wrap">
+                    <Button
+                      label="Force Refresh"
+                      size="sm"
+                      variant="secondary"
+                      icon={<RefreshCw size={11} />}
+                      isLoading={ctiLoading}
+                      isDisabled={readOnly}
+                      onClick={() => void runCtiEnrich(ctiResult.indicator, true)}
+                    />
+                    <Button
+                      label="Dismiss"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setCtiResult(null)}
+                    />
+                  </div>
+                </div>
+                <div className="abw-a2ui-news-grid">
+                  {ctiResult.findings.map((f) => {
+                    const safeRef = safeExternalUrl(f.reference_url);
+                    return (
+                      <div key={f.provider} className="abw-a2ui-news-item">
+                        <div
+                          className="abw-flex-wrap"
+                          style={{ justifyContent: 'space-between', marginBottom: 4 }}
+                        >
+                          <strong style={{ fontSize: 12.5 }}>{f.provider_name}</strong>
+                          <div className="abw-flex-wrap">
+                            <Badge
+                              variant={
+                                f.verdict === 'MALICIOUS'
+                                  ? 'error'
+                                  : f.verdict === 'SUSPICIOUS'
+                                    ? 'orange'
+                                    : f.verdict === 'BENIGN'
+                                      ? 'success'
+                                      : f.verdict === 'ERROR'
+                                        ? 'warning'
+                                        : 'neutral'
+                              }
+                              label={f.verdict}
+                            />
+                            <Badge variant="neutral" label={`${f.latency_ms} ms`} />
+                          </div>
+                        </div>
+                        <Text type="supporting" size="xsm" display="block" style={{ marginBottom: 6 }}>
+                          {redactDisplayText(f.summary, opsecMode)}
+                        </Text>
+                        <div
+                          className="abw-flex-wrap"
+                          style={{ justifyContent: 'space-between', marginTop: 'auto' }}
+                        >
+                          <div className="abw-flex-wrap">
+                            {f.tags.slice(0, 4).map((t) => (
+                              <Badge key={t} variant="info" label={t} />
+                            ))}
+                          </div>
+                          {safeRef && !opsecMode && (
+                            <a
+                              href={safeRef}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="abw-a2ui-ext-link"
+                            >
+                              Report <ExternalLink size={11} />
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+          </div>
         </div>
       </section>
 
@@ -547,18 +734,28 @@ export function NetworkIocView({
                               )}
                             </td>
                             <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
-                              <Button
-                                label="Copy Filter"
-                                size="sm"
-                                variant="secondary"
-                                icon={<Filter size={11} />}
-                                onClick={() =>
-                                  void copyFilterText(
-                                    hit.wireshark_filter,
-                                    `Wireshark filter for ${hit.indicator}`
-                                  )
-                                }
-                              />
+                              <div className="abw-flex-wrap" style={{ justifyContent: 'flex-end' }}>
+                                <Button
+                                  label="Enrich"
+                                  size="sm"
+                                  variant="secondary"
+                                  icon={<Sparkles size={11} />}
+                                  isDisabled={readOnly || ctiLoading}
+                                  onClick={() => void runCtiEnrich(hit.indicator)}
+                                />
+                                <Button
+                                  label="Copy Filter"
+                                  size="sm"
+                                  variant="secondary"
+                                  icon={<Filter size={11} />}
+                                  onClick={() =>
+                                    void copyFilterText(
+                                      hit.wireshark_filter,
+                                      `Wireshark filter for ${hit.indicator}`
+                                    )
+                                  }
+                                />
+                              </div>
                             </td>
                           </tr>
                         ))}
@@ -700,16 +897,26 @@ export function NetworkIocView({
                               <td className="abw-mono" style={{ fontSize: 11, color: 'var(--soc-text-muted)' }}>
                                 {ep.ports.slice(0, 4).join(', ') || '—'}
                               </td>
-                              <td style={{ textAlign: 'right' }}>
-                                <Button
-                                  label="WS"
-                                  size="sm"
-                                  variant="secondary"
-                                  icon={<Filter size={10} />}
-                                  onClick={() =>
-                                    void copyFilterText(ep.wireshark_filter, `filter for ${ep.ip}`)
-                                  }
-                                />
+                              <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                <div className="abw-flex-wrap" style={{ justifyContent: 'flex-end' }}>
+                                  <Button
+                                    label="Enrich"
+                                    size="sm"
+                                    variant="secondary"
+                                    icon={<Sparkles size={10} />}
+                                    isDisabled={readOnly || ctiLoading}
+                                    onClick={() => void runCtiEnrich(ep.ip)}
+                                  />
+                                  <Button
+                                    label="WS"
+                                    size="sm"
+                                    variant="secondary"
+                                    icon={<Filter size={10} />}
+                                    onClick={() =>
+                                      void copyFilterText(ep.wireshark_filter, `filter for ${ep.ip}`)
+                                    }
+                                  />
+                                </div>
                               </td>
                             </tr>
                           ))}
@@ -863,19 +1070,29 @@ export function NetworkIocView({
                         label={c2.status}
                       />
                     </td>
-                    <td style={{ textAlign: 'right' }}>
-                      <Button
-                        label="WS"
-                        size="sm"
-                        variant="secondary"
-                        icon={<Filter size={10} />}
-                        onClick={() =>
-                          void copyFilterText(
-                            `ip.addr == ${c2.ip_address} && tcp.port == ${c2.port}`,
-                            `C2 Wireshark filter (${c2.malware})`
-                          )
-                        }
-                      />
+                    <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <div className="abw-flex-wrap" style={{ justifyContent: 'flex-end' }}>
+                        <Button
+                          label="Enrich"
+                          size="sm"
+                          variant="secondary"
+                          icon={<Sparkles size={10} />}
+                          isDisabled={readOnly || ctiLoading}
+                          onClick={() => void runCtiEnrich(c2.ip_address)}
+                        />
+                        <Button
+                          label="WS"
+                          size="sm"
+                          variant="secondary"
+                          icon={<Filter size={10} />}
+                          onClick={() =>
+                            void copyFilterText(
+                              `ip.addr == ${c2.ip_address} && tcp.port == ${c2.port}`,
+                              `C2 Wireshark filter (${c2.malware})`
+                            )
+                          }
+                        />
+                      </div>
                     </td>
                   </tr>
                 ))}

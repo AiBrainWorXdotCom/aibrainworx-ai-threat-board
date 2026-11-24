@@ -11,6 +11,11 @@ import type {
   AuthSessionPublic,
   AuthStatusResponse,
   BulkIocResponse,
+  CtiConfigPublic,
+  CtiConfigUpdateRequest,
+  CtiEnrichmentResponse,
+  CtiProviderId,
+  CtiTestResponse,
   CustomFeedConfig,
   CustomFeedCreateRequest,
   CveTriage,
@@ -21,6 +26,7 @@ import type {
   MyStackPayload,
   MyStackUpdateRequest,
   NetworkTelemetry,
+  OtxSyncResponse,
   PcapAnalysisReport,
   SnapshotImportResult,
   StackImportResponse,
@@ -421,6 +427,54 @@ export const api = {
       : fetchJson<PcapAnalysisReport>('/api/iocs/pcap/sample', {
           method: 'POST',
           body: JSON.stringify({}),
+        }),
+
+  getCtiConfig: async (): Promise<CtiConfigPublic> =>
+    IS_DEMO_MODE ? demoApi.getCtiConfig() : fetchJson<CtiConfigPublic>('/api/cti/config'),
+
+  updateCtiConfig: async (req: CtiConfigUpdateRequest): Promise<CtiConfigPublic> =>
+    IS_DEMO_MODE
+      ? demoApi.updateCtiConfig(req)
+      : fetchJson<CtiConfigPublic>('/api/cti/config', {
+          method: 'PUT',
+          body: JSON.stringify(req),
+        }),
+
+  testCtiProvider: async (
+    provider: CtiProviderId,
+    api_key?: string
+  ): Promise<CtiTestResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.testCtiProvider(provider)
+      : fetchJson<CtiTestResponse>('/api/cti/test', {
+          method: 'POST',
+          body: JSON.stringify({ provider, api_key }),
+        }),
+
+  syncOtxPulses: async (): Promise<OtxSyncResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.syncOtxPulses()
+      : fetchJson<OtxSyncResponse>('/api/cti/otx/sync', {
+          method: 'POST',
+          body: JSON.stringify({}),
+        }),
+
+  enrichIndicator: async (
+    indicator: string,
+    force_refresh = false
+  ): Promise<CtiEnrichmentResponse> =>
+    IS_DEMO_MODE
+      ? demoApi.enrichIndicator(indicator)
+      : fetchJson<CtiEnrichmentResponse>('/api/cti/enrich', {
+          method: 'POST',
+          body: JSON.stringify({ indicator, force_refresh }),
+        }),
+
+  clearCtiCache: async (): Promise<{ ok: boolean; cleared: number }> =>
+    IS_DEMO_MODE
+      ? demoApi.clearCtiCache()
+      : fetchJson<{ ok: boolean; cleared: number }>('/api/cti/cache', {
+          method: 'DELETE',
         }),
 
   getAlerts: async () => {

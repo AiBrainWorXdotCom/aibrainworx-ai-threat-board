@@ -2,7 +2,7 @@
 
 ## Threat Model & Local-First Posture
 
-**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.5.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, declarative zero-HTML agentic UI, memory-safe offline packet triage, SSRF containment, credential isolation, and untrusted telemetry sanitization:
+**AiBrainWorX AI CyberSecurity Threat Analysis Board (v0.6.0)** runs locally on your workstation or inside a locked-down private container. Security controls prioritize local operational privacy, strong local authentication, declarative zero-HTML agentic UI, memory-safe offline packet triage, opt-in CTI enrichment privacy guards, SSRF containment, credential isolation, and untrusted telemetry sanitization:
 
 1. **Local Argon2id Authentication, Ephemeral Sessions & Offline TOTP 2FA:**
    - Authentication is enabled by default even on `127.0.0.1:8080`. On first run, the browser opens the **First-Run Admin Setup** wizard (`POST /api/auth/setup`, permanently locked with `403` once an account exists).
@@ -42,7 +42,12 @@
    - **RAM-Only & Strict Anti-DoS Bounds:** Raw capture bytes are parsed strictly in memory and never persisted to SQLite or disk. Endpoints enforce a scoped `25 MB` Axum body limit (`POST /api/iocs/pcap`), `250,000` max packets per capture, `5,000` unique endpoint/domain caps, 16-hop DNS compression-pointer loop guards, and `403 Forbidden` in `--wallboard` read-only mode.
    - **OPSEC Masking Parity:** When **OPSEC Redact Mode** is active, extracted PCAP IPs, observed hostnames/SNIs, DNS anomaly strings, and rendered/copied Wireshark display filters are automatically masked (`198.51.xxx.xxx`, `"••••.invalid"`).
 
-8. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
+8. **BYO CTI Enrichment Privacy Guard, DNS-Pinned HTTPS & Secret Hygiene (`backend/src/cti.rs`):**
+   - **Hard Internal-Indicator Refusal:** Before any external enrichment request leaves the workstation (`POST /api/cti/enrich`), the Privacy Guard refuses RFC1918 private IPs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback, link-local, CGNAT, multicast, ULA, and internal hostnames (`.local`, `.internal`, `.lan`, `.home`, `.corp`, `.arpa`, `.invalid`), returning `400 Bad Request` so internal LAN topology never leaks to third-party CTI vendors.
+   - **DNS-Pinned Zero-Redirect HTTPS & Key Isolation:** Every AlienVault/LevelBlue OTX, GreyNoise Community, AbuseIPDB v2, and VirusTotal v3 call runs over DNS-pinned, zero-redirect `https://` (`build_pinned_http_client`). All 4 CTI provider keys are marked `#[serde(skip)]` (never serialized to SQLite, API responses, or offline snapshots), stay in session RAM by default, and optionally persist via native OS Keychain (`keyring` v3).
+   - **Local 24-Hour SQLite Cache & Private OTX Pulses:** Enrichment verdicts cache locally for 24 hours in `cti_enrichment_cache` (auto-pruned at 500 entries) and subscribed OTX pulses sync privately into `otx_pulses` (capped at `15,000` indicators/pulse) for local IOC & PCAP correlation — both excluded from secret-stripped offline snapshots and disabled in `--offline` / `--wallboard` modes as appropriate.
+
+9. **OPSEC Redact Mode, Defanging, CSV Formula Neutralization & Air-Gapped Modes:**
    - **OPSEC Redact Mode** masks public attacker IPs, C2 endpoints, and phishing domains in the UI for safe screen-sharing and demos.
    - Phishing URLs render defanged (`hxxps://`, `[.]`) as non-clickable text.
    - Spreadsheet CSV exports escape leading `=`, `+`, `-`, `@`, `\t`, and `\r` characters to neutralize formula injection.

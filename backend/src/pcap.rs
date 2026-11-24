@@ -1024,6 +1024,14 @@ pub fn analyze_pcap_bytes(
                 severity = "HIGH";
             }
         }
+        if let Some(pulses) = store.otx_pulses.ip_pulses.get(&ip_str) {
+            feeds.push("AlienVault / LevelBlue OTX".to_string());
+            details.push(format!("OTX Pulses: {}", pulses.join(" · ")));
+            if severity == "MEDIUM" {
+                ind_type = "OTX Pulse IP";
+                severity = "HIGH";
+            }
+        }
 
         let mut ports: Vec<u16> = stat.ports.iter().copied().collect();
         ports.sort_unstable();
@@ -1100,6 +1108,17 @@ pub fn analyze_pcap_bytes(
         if let Some(brand) = phish_match {
             feeds.push("OpenPhish".to_string());
             details.push(format!("Active phishing campaign domain ({brand})"));
+        }
+        let otx_dom_match = store.otx_pulses.domain_pulses.get(host).or_else(|| {
+            host.split_once('.')
+                .and_then(|(_, parent)| store.otx_pulses.domain_pulses.get(parent))
+        });
+        if let Some(pulses) = otx_dom_match {
+            feeds.push("AlienVault / LevelBlue OTX".to_string());
+            details.push(format!("OTX Pulses: {}", pulses.join(" · ")));
+            if hit_type == "Phishing Domain" && phish_match.is_none() {
+                hit_type = "OTX Pulse Domain";
+            }
         }
 
         let suspicious_reason = check_dns_tunneling_suspect(host);

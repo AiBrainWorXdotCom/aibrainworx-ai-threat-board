@@ -525,6 +525,101 @@ export interface SnapshotImportResult {
   sha256_verified: boolean;
 }
 
+export type CtiProviderId = 'otx' | 'greynoise' | 'abuseipdb' | 'virustotal';
+
+export interface OtxPulseSummary {
+  id: string;
+  name: string;
+  author: string;
+  modified: string;
+  indicator_count: number;
+  tags: string[];
+}
+
+export interface CtiProviderStatusPublic {
+  id: CtiProviderId;
+  name: string;
+  enabled: boolean;
+  has_key: boolean;
+  key_masked: string;
+  env_var: string;
+  env_key_present: boolean;
+  keychain_has_key: boolean;
+  key_optional: boolean;
+  supports: string[];
+  description: string;
+  signup_url: string;
+}
+
+export interface CtiConfigPublic {
+  save_keys_to_keychain: boolean;
+  keychain_available: boolean;
+  otx_sync_pulses: boolean;
+  otx_pulse_count: number;
+  otx_indicator_count: number;
+  otx_last_synced_at: string | null;
+  otx_pulses_preview: OtxPulseSummary[];
+  cached_enrichment_count: number;
+  providers: CtiProviderStatusPublic[];
+}
+
+export interface CtiConfigUpdateRequest {
+  otx_enabled?: boolean;
+  otx_sync_pulses?: boolean;
+  greynoise_enabled?: boolean;
+  abuseipdb_enabled?: boolean;
+  virustotal_enabled?: boolean;
+  save_keys_to_keychain?: boolean;
+  otx_api_key?: string;
+  clear_otx_key?: boolean;
+  greynoise_api_key?: string;
+  clear_greynoise_key?: boolean;
+  abuseipdb_api_key?: string;
+  clear_abuseipdb_key?: boolean;
+  virustotal_api_key?: string;
+  clear_virustotal_key?: boolean;
+}
+
+export interface CtiTestResponse {
+  provider: CtiProviderId;
+  ok: boolean;
+  latency_ms: number;
+  message: string;
+}
+
+export interface OtxSyncResponse {
+  ok: boolean;
+  pulse_count: number;
+  indicator_count: number;
+  ip_count: number;
+  domain_count: number;
+  hash_count: number;
+  latency_ms: number;
+  message: string;
+}
+
+export interface CtiProviderFinding {
+  provider: CtiProviderId;
+  provider_name: string;
+  ok: boolean;
+  verdict: string;
+  score: number | null;
+  summary: string;
+  tags: string[];
+  reference_url: string | null;
+  latency_ms: number;
+  error: string | null;
+}
+
+export interface CtiEnrichmentResponse {
+  indicator: string;
+  indicator_type: string;
+  overall_verdict: string;
+  enriched_at: string;
+  cached: boolean;
+  findings: CtiProviderFinding[];
+}
+
 export interface ServerModeInfo {
   version: string;
   wallboard_mode: boolean;

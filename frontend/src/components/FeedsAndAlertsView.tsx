@@ -21,6 +21,7 @@ import {
   Webhook,
 } from 'lucide-react';
 import { api, safeExternalUrl, severityBadgeVariant } from '../api';
+import { CtiEnrichmentHub } from './CtiEnrichmentHub';
 import type {
   AlertRules,
   CustomFeedConfig,
@@ -732,6 +733,9 @@ export function FeedsAndAlertsView({
           </div>
         </section>
       </div>
+
+      {/* Optional BYO CTI Enrichment Hub (OTX · GreyNoise · AbuseIPDB · VirusTotal) */}
+      <CtiEnrichmentHub readOnly={readOnly} onUpdated={onRulesUpdated} />
 
       {/* Bottom: 25-Source Public Data Feed Health Matrix with Per-Feed Toggle */}
       <section className="abw-panel">

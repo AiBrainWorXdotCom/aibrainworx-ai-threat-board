@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
 
 use crate::auth::AuthRateLimiter;
+use crate::cti::{CtiConfig, CtiEnrichmentResponse, OtxPulseCache};
 use crate::models::{
     AiConfig, AiThreatBrief, AlertRules, CveTriage, FeedHealth, FeedSettings, MyStackConfig,
     NetworkTelemetry, SseEvent, SweepDelta, ThreatAlert, ThreatNewsItem, Vulnerability,
@@ -52,6 +53,12 @@ pub struct ThreatStore {
     #[serde(default)]
     pub webhooks: Vec<WebhookTarget>,
     #[serde(default)]
+    pub cti_config: CtiConfig,
+    #[serde(default)]
+    pub otx_pulses: OtxPulseCache,
+    #[serde(default)]
+    pub cti_enrichment_cache: HashMap<String, CtiEnrichmentResponse>,
+    #[serde(default)]
     pub latest_delta: Option<SweepDelta>,
     pub last_sweep_at: Option<DateTime<Utc>>,
     pub next_sweep_at: Option<DateTime<Utc>>,
@@ -89,6 +96,8 @@ impl ThreatStore {
                 }
             }
         }
+
+        crate::cti::hydrate_cti_keys_from_keychain(&mut self.cti_config);
     }
 
     #[allow(dead_code)]
@@ -198,6 +207,16 @@ impl ThreatStore {
                 }
             }
             self.seen_ids = keep;
+        }
+        if self.cti_enrichment_cache.len() > 500 {
+            let mut entries: Vec<(String, DateTime<Utc>)> = self
+                .cti_enrichment_cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.enriched_at))
+                .collect();
+            entries.sort_by_key(|a| std::cmp::Reverse(a.1));
+            let keep: HashSet<String> = entries.into_iter().take(400).map(|e| e.0).collect();
+            self.cti_enrichment_cache.retain(|k, _| keep.contains(k));
         }
     }
 }

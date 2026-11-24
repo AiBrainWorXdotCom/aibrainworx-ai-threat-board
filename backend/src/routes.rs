@@ -87,6 +87,11 @@ pub fn api_router(state: AppState) -> Router {
         .route("/iocs/export", get(export_iocs))
         .route("/iocs/wireshark-filter", get(get_wireshark_filter))
         .route("/iocs/pcap/sample", post(analyze_pcap_sample))
+        .route("/cti/config", get(get_cti_config).put(update_cti_config))
+        .route("/cti/test", post(test_cti_connection))
+        .route("/cti/otx/sync", post(sync_otx_pulses_route))
+        .route("/cti/enrich", post(enrich_cti_indicator))
+        .route("/cti/cache", axum::routing::delete(clear_cti_cache))
         .route("/alerts", get(list_alerts))
         .route("/alerts/ack-all", post(ack_all_alerts))
         .route("/alerts/test", post(trigger_test_alert))
@@ -1864,6 +1869,27 @@ fn lookup_single_ioc(store: &ThreatStore, raw: &str) -> IocLookupResult {
             detail: "Present in Emerging Threats compromised-ips blocklist".to_string(),
         });
     }
+    if let Some(pulses) = store.otx_pulses.ip_pulses.get(&q) {
+        hits.push(IocHit {
+            feed: "AlienVault / LevelBlue OTX (Local Sync)".to_string(),
+            indicator_type: "OTX Pulse IP".to_string(),
+            detail: pulses.join(" · "),
+        });
+    }
+    if let Some(pulses) = store.otx_pulses.domain_pulses.get(&q_lower) {
+        hits.push(IocHit {
+            feed: "AlienVault / LevelBlue OTX (Local Sync)".to_string(),
+            indicator_type: "OTX Pulse Domain".to_string(),
+            detail: pulses.join(" · "),
+        });
+    }
+    if let Some(pulses) = store.otx_pulses.hash_pulses.get(&q_lower) {
+        hits.push(IocHit {
+            feed: "AlienVault / LevelBlue OTX (Local Sync)".to_string(),
+            indicator_type: "OTX Malware Hash".to_string(),
+            detail: pulses.join(" · "),
+        });
+    }
     for ph in &store.telemetry.phishing_urls {
         if ph.domain.to_ascii_lowercase().contains(&q_lower)
             || ph.url.to_ascii_lowercase().contains(&q_lower)
@@ -2024,6 +2050,188 @@ async fn analyze_pcap_sample(State(state): State<AppState>) -> impl IntoResponse
         )
             .into_response(),
     }
+}
+
+async fn get_cti_config(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.store.read().await;
+    Json(crate::cti::to_public_cti_config(
+        &store.cti_config,
+        &store.otx_pulses,
+        store.cti_enrichment_cache.len(),
+    ))
+}
+
+async fn update_cti_config(
+    State(state): State<AppState>,
+    Json(req): Json<crate::cti::CtiConfigUpdateRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    let mut store = state.store.write().await;
+    crate::cti::apply_cti_config_update(&mut store.cti_config, req);
+    let _ = state.persist_store(&store);
+    Json(crate::cti::to_public_cti_config(
+        &store.cti_config,
+        &store.otx_pulses,
+        store.cti_enrichment_cache.len(),
+    ))
+    .into_response()
+}
+
+async fn test_cti_connection(
+    State(state): State<AppState>,
+    Json(req): Json<crate::cti::CtiTestRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    if state.server_mode.offline_mode {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Offline Mode (--offline) is active; outbound CTI provider checks are disabled."
+            })),
+        )
+            .into_response();
+    }
+    let eff_key = {
+        let store = state.store.read().await;
+        req.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| crate::cti::effective_cti_key(&store.cti_config, req.provider))
+    };
+    let res = crate::cti::test_cti_provider(req.provider, eff_key.as_deref()).await;
+    Json(res).into_response()
+}
+
+async fn sync_otx_pulses_route(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    if state.server_mode.offline_mode {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Offline Mode (--offline) is active; outbound OTX pulse sync is disabled."
+            })),
+        )
+            .into_response();
+    }
+    let otx_key = {
+        let store = state.store.read().await;
+        crate::cti::effective_cti_key(&store.cti_config, crate::cti::CtiProviderId::Otx)
+    };
+    let Some(key) = otx_key else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "AlienVault OTX API key not configured. Enter your key in Feeds & Alerts → BYO CTI Enrichment (or set OTX_API_KEY)."
+            })),
+        )
+            .into_response();
+    };
+
+    match crate::cti::sync_otx_subscribed_pulses(&key).await {
+        Ok((cache, latency_ms)) => {
+            let resp = crate::cti::OtxSyncResponse {
+                ok: true,
+                pulse_count: cache.pulse_count,
+                indicator_count: cache.indicator_count,
+                ip_count: cache.ip_pulses.len(),
+                domain_count: cache.domain_pulses.len(),
+                hash_count: cache.hash_pulses.len(),
+                latency_ms,
+                message: format!(
+                    "Synced {} OTX pulse(s) ({} indicators saved to SQLite for local IOC & PCAP correlation)",
+                    cache.pulse_count, cache.indicator_count
+                ),
+            };
+            let mut store = state.store.write().await;
+            store.otx_pulses = cache;
+            let _ = state.persist_store(&store);
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+        Err(msg) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn enrich_cti_indicator(
+    State(state): State<AppState>,
+    Json(req): Json<crate::cti::CtiEnrichRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    if state.server_mode.offline_mode {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Offline Mode (--offline) is active; external CTI enrichment is disabled."
+            })),
+        )
+            .into_response();
+    }
+
+    let validated = match crate::cti::classify_and_validate_indicator(&req.indicator) {
+        Ok(ind) => ind,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let cache_key = validated.as_str().to_ascii_lowercase();
+
+    // Return fresh SQLite-persisted enrichment hit (24h TTL) unless force_refresh requested
+    let cti_cfg = {
+        let store = state.store.read().await;
+        if !req.force_refresh {
+            if let Some(hit) = store.cti_enrichment_cache.get(&cache_key) {
+                if (Utc::now() - hit.enriched_at).num_hours() < 24 {
+                    let mut cached_resp = hit.clone();
+                    cached_resp.cached = true;
+                    return (StatusCode::OK, Json(cached_resp)).into_response();
+                }
+            }
+        }
+        store.cti_config.clone()
+    };
+
+    match crate::cti::enrich_indicator(validated.as_str(), &cti_cfg).await {
+        Ok(res) => {
+            let mut store = state.store.write().await;
+            store.cti_enrichment_cache.insert(cache_key, res.clone());
+            store.prune();
+            let _ = state.persist_store(&store);
+            (StatusCode::OK, Json(res)).into_response()
+        }
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn clear_cti_cache(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(resp) = require_writable(&state) {
+        return *resp;
+    }
+    let mut store = state.store.write().await;
+    let cleared = store.cti_enrichment_cache.len();
+    store.cti_enrichment_cache.clear();
+    let _ = state.persist_store(&store);
+    Json(serde_json::json!({ "ok": true, "cleared": cleared })).into_response()
 }
 
 async fn list_alerts(State(state): State<AppState>) -> impl IntoResponse {

@@ -2,6 +2,7 @@ mod a2ui;
 mod ai_providers;
 mod analyzer;
 mod auth;
+mod cti;
 mod export;
 mod feeds;
 mod models;

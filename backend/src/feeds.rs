@@ -770,6 +770,30 @@ pub async fn run_sweep(state: AppState) {
         }
     }
 
+    // Optional private local sync of subscribed AlienVault / LevelBlue OTX Pulses
+    let otx_auto_key = {
+        let store = state.store.read().await;
+        if store.cti_config.otx_sync_pulses && store.cti_config.otx_enabled {
+            crate::cti::effective_cti_key(&store.cti_config, crate::cti::CtiProviderId::Otx)
+        } else {
+            None
+        }
+    };
+    if let Some(key) = otx_auto_key {
+        match crate::cti::sync_otx_subscribed_pulses(&key).await {
+            Ok((cache, ms)) => {
+                info!(
+                    "Auto-synced {} AlienVault OTX pulse(s) ({} indicators) in {} ms",
+                    cache.pulse_count, cache.indicator_count, ms
+                );
+                let mut store = state.store.write().await;
+                store.otx_pulses = cache;
+                let _ = state.persist_store(&store);
+            }
+            Err(e) => warn!("Optional OTX pulse sync skipped: {e}"),
+        }
+    }
+
     // Emit SSE alerts individually so frontend shows live banner + toast immediately
     let new_alert_count = new_alerts.len();
     for alert in new_alerts {

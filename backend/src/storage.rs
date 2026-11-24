@@ -228,6 +228,18 @@ impl SqliteStorage {
         if let Some(hooks) = load_kv_json::<Vec<WebhookTarget>>(&conn, "webhooks")? {
             store.webhooks = hooks;
         }
+        if let Some(cti_cfg) = load_kv_json::<crate::cti::CtiConfig>(&conn, "cti_config")? {
+            store.cti_config = cti_cfg;
+        }
+        if let Some(otx_p) = load_kv_json::<crate::cti::OtxPulseCache>(&conn, "otx_pulses")? {
+            store.otx_pulses = otx_p;
+        }
+        if let Some(enr_cache) = load_kv_json::<
+            std::collections::HashMap<String, crate::cti::CtiEnrichmentResponse>,
+        >(&conn, "cti_enrichment_cache")?
+        {
+            store.cti_enrichment_cache = enr_cache;
+        }
         if let Some(tele) = load_kv_json::<NetworkTelemetry>(&conn, "telemetry")? {
             store.telemetry = tele;
         }
@@ -343,6 +355,14 @@ impl SqliteStorage {
         save_kv_json(&tx, "my_stack", &store.my_stack, &now_str)?;
         save_kv_json(&tx, "feed_settings", &store.feed_settings, &now_str)?;
         save_kv_json(&tx, "webhooks", &store.webhooks, &now_str)?;
+        save_kv_json(&tx, "cti_config", &store.cti_config, &now_str)?;
+        save_kv_json(&tx, "otx_pulses", &store.otx_pulses, &now_str)?;
+        save_kv_json(
+            &tx,
+            "cti_enrichment_cache",
+            &store.cti_enrichment_cache,
+            &now_str,
+        )?;
         save_kv_json(&tx, "telemetry", &store.telemetry, &now_str)?;
         save_kv_json(&tx, "alerts", &store.alerts, &now_str)?;
         save_kv_json(&tx, "feed_health", &store.feed_health, &now_str)?;
