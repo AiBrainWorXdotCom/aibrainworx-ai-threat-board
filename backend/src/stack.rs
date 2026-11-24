@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde_json::Value;
@@ -7,6 +8,7 @@ use crate::models::{MyStackConfig, StackComponent, StackMatchSummary, Vulnerabil
 use crate::security::strip_invisible_unicode;
 
 const MAX_COMPONENTS: usize = 5000;
+const MAX_LOCKFILE_DEPTH: usize = 32;
 
 /// Detects manifest/SBOM format and extracts normalized dependency components completely locally.
 pub fn parse_stack_manifest(
@@ -249,7 +251,7 @@ fn parse_package_lock(val: &Value, src_label: &str) -> Vec<StackComponent> {
     }
     if out.is_empty() {
         if let Some(deps) = val.get("dependencies").and_then(|v| v.as_object()) {
-            collect_package_lock_deps(deps, src_label, &mut out);
+            collect_package_lock_deps(deps, src_label, &mut out, 0);
         }
     }
     out
@@ -259,7 +261,11 @@ fn collect_package_lock_deps(
     deps: &serde_json::Map<String, Value>,
     src_label: &str,
     out: &mut Vec<StackComponent>,
+    depth: usize,
 ) {
+    if depth >= MAX_LOCKFILE_DEPTH {
+        return;
+    }
     for (name, meta) in deps {
         if out.len() >= MAX_COMPONENTS {
             break;
@@ -277,7 +283,7 @@ fn collect_package_lock_deps(
             source_file: src_label.to_string(),
         });
         if let Some(nested) = meta.get("dependencies").and_then(|v| v.as_object()) {
-            collect_package_lock_deps(nested, src_label, out);
+            collect_package_lock_deps(nested, src_label, out, depth + 1);
         }
     }
 }
@@ -353,9 +359,11 @@ fn parse_cargo_lock(content: &str, src_label: &str) -> Vec<StackComponent> {
 }
 
 fn parse_cargo_toml(content: &str, src_label: &str) -> Vec<StackComponent> {
+    static RE_VER: OnceLock<Regex> = OnceLock::new();
+    let re_ver =
+        RE_VER.get_or_init(|| Regex::new(r#"version\s*=\s*"([^"]+)""#).expect("valid regex"));
     let mut out = Vec::new();
     let mut in_deps = false;
-    let re_ver = Regex::new(r#"version\s*=\s*"([^"]+)""#).expect("valid regex");
 
     for raw_line in content.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -398,10 +406,12 @@ fn parse_cargo_toml(content: &str, src_label: &str) -> Vec<StackComponent> {
 }
 
 fn parse_requirements_txt(content: &str, src_label: &str) -> Vec<StackComponent> {
-    let mut out = Vec::new();
-    let re =
+    static RE_REQ: OnceLock<Regex> = OnceLock::new();
+    let re = RE_REQ.get_or_init(|| {
         Regex::new(r#"^([A-Za-z0-9._-]+)(?:\[[^\]]+\])?\s*(?:[=<>!~]+\s*([A-Za-z0-9.*+_!-]+))?"#)
-            .expect("valid regex");
+            .expect("valid regex")
+    });
+    let mut out = Vec::new();
 
     for raw_line in content.lines() {
         let without_comment = raw_line.split('#').next().unwrap_or("").trim();
@@ -434,14 +444,19 @@ fn parse_requirements_txt(content: &str, src_label: &str) -> Vec<StackComponent>
 }
 
 fn parse_pyproject_toml(content: &str, src_label: &str) -> Vec<StackComponent> {
+    static RE_SPEC: OnceLock<Regex> = OnceLock::new();
+    let re_spec = RE_SPEC.get_or_init(|| {
+        Regex::new(r#"^([A-Za-z0-9._-]+)(?:\[[^\]]+\])?\s*(?:[=<>!~^]+\s*([A-Za-z0-9.*+_!-]+))?"#)
+            .expect("valid regex")
+    });
     let mut out = Vec::new();
     let mut in_array = false;
     let mut in_poetry = false;
-    let re_spec =
-        Regex::new(r#"^([A-Za-z0-9._-]+)(?:\[[^\]]+\])?\s*(?:[=<>!~^]+\s*([A-Za-z0-9.*+_!-]+))?"#)
-            .expect("valid regex");
 
     for raw_line in content.lines() {
+        if out.len() >= MAX_COMPONENTS {
+            break;
+        }
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -457,6 +472,9 @@ fn parse_pyproject_toml(content: &str, src_label: &str) -> Vec<StackComponent> {
         if line.starts_with("dependencies") && line.contains('[') {
             in_array = !line.ends_with(']');
             for chunk in line.split('"').skip(1).step_by(2) {
+                if out.len() >= MAX_COMPONENTS {
+                    break;
+                }
                 if let Some(caps) = re_spec.captures(chunk.trim()) {
                     let name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                     if !name.is_empty() {
@@ -510,6 +528,9 @@ fn parse_go_mod(content: &str, src_label: &str) -> Vec<StackComponent> {
     let mut out = Vec::new();
     let mut in_block = false;
     for raw_line in content.lines() {
+        if out.len() >= MAX_COMPONENTS {
+            break;
+        }
         let line = raw_line.split("//").next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
@@ -548,12 +569,22 @@ fn parse_go_mod(content: &str, src_label: &str) -> Vec<StackComponent> {
 }
 
 fn parse_pom_xml(content: &str, src_label: &str) -> Vec<StackComponent> {
+    static RE_DEP: OnceLock<Regex> = OnceLock::new();
+    static RE_GROUP: OnceLock<Regex> = OnceLock::new();
+    static RE_ARTIFACT: OnceLock<Regex> = OnceLock::new();
+    static RE_VER: OnceLock<Regex> = OnceLock::new();
+    let re_dep = RE_DEP
+        .get_or_init(|| Regex::new(r"(?is)<dependency>(.*?)</dependency>").expect("valid regex"));
+    let re_group = RE_GROUP.get_or_init(|| {
+        Regex::new(r"(?is)<groupId>\s*([^<\s]+)\s*</groupId>").expect("valid regex")
+    });
+    let re_artifact = RE_ARTIFACT.get_or_init(|| {
+        Regex::new(r"(?is)<artifactId>\s*([^<\s]+)\s*</artifactId>").expect("valid regex")
+    });
+    let re_ver = RE_VER.get_or_init(|| {
+        Regex::new(r"(?is)<version>\s*([^<\s]+)\s*</version>").expect("valid regex")
+    });
     let mut out = Vec::new();
-    let re_dep = Regex::new(r"(?is)<dependency>(.*?)</dependency>").expect("valid regex");
-    let re_group = Regex::new(r"(?is)<groupId>\s*([^<\s]+)\s*</groupId>").expect("valid regex");
-    let re_artifact =
-        Regex::new(r"(?is)<artifactId>\s*([^<\s]+)\s*</artifactId>").expect("valid regex");
-    let re_ver = Regex::new(r"(?is)<version>\s*([^<\s]+)\s*</version>").expect("valid regex");
 
     for dep_cap in re_dep.captures_iter(content).take(MAX_COMPONENTS) {
         let block = dep_cap.get(1).map(|m| m.as_str()).unwrap_or("");

@@ -587,6 +587,7 @@ pub async fn list_models(_http: &reqwest::Client, cfg: &AiConfig) -> AiModelsRes
             };
         }
     };
+    let base = validated.url.as_str().trim_end_matches('/').to_string();
     let http = match build_pinned_http_client(
         &validated,
         Duration::from_secs(12),
@@ -973,6 +974,7 @@ pub async fn generate_completion(
         },
     )
     .await?;
+    let base = validated.url.as_str().trim_end_matches('/').to_string();
     let http = build_pinned_http_client(&validated, timeout, "AiBrainWorX-ThreatBoard/0.2")?;
     let t0 = Instant::now();
 

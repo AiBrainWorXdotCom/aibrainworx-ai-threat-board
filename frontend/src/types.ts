@@ -365,6 +365,7 @@ export interface WebhookTargetPublic {
   kev_only: boolean;
   stack_only: boolean;
   has_signing_secret: boolean;
+  save_secret_to_keychain?: boolean;
   last_status: string | null;
   last_sent_at: string | null;
   failure_count: number;
@@ -379,6 +380,7 @@ export interface WebhookCreateRequest {
   kev_only?: boolean;
   stack_only?: boolean;
   signing_secret?: string;
+  save_secret_to_keychain?: boolean;
 }
 
 export interface WebhookUpdateRequest {
@@ -386,6 +388,10 @@ export interface WebhookUpdateRequest {
   min_severity?: Severity;
   kev_only?: boolean;
   stack_only?: boolean;
+  url?: string;
+  signing_secret?: string;
+  clear_signing_secret?: boolean;
+  save_secret_to_keychain?: boolean;
 }
 
 export interface WebhookTestResponse {

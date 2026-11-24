@@ -94,35 +94,57 @@ export function redactWiresharkFilter(filter: string, opsec: boolean): string {
   return out;
 }
 
+function isSafeMarkdownTarget(rawTarget: string): boolean {
+  const first = rawTarget.trim().split(/\s+/)[0] ?? '';
+  const unwrapped = first.startsWith('<') && first.endsWith('>') ? first.slice(1, -1).trim() : first;
+  if (!unwrapped) return false;
+  const lower = unwrapped.toLowerCase();
+  if (lower.includes('&#') || lower.includes('&colon;') || lower.startsWith('//')) {
+    return false;
+  }
+  return (
+    lower.startsWith('https://') ||
+    lower.startsWith('http://') ||
+    lower.startsWith('#') ||
+    lower.startsWith('/')
+  );
+}
+
 /**
- * Strips raw HTML tags, remote Markdown images (`![alt](url)`), invisible Unicode
- * controls/bidi overrides, and dangerous URI schemes (`javascript:`, `data:`, etc.).
+ * Strips all raw HTML tags, inline & reference Markdown images (`![alt](url)`, `![alt][ref]`),
+ * invisible Unicode controls/bidi overrides, and dangerous URI schemes (`javascript:`, `data:`,
+ * entity-encoded or reference-defined links).
  */
 export function sanitizeMarkdownClient(md: string): string {
   if (!md) return '';
   // Remove invisible zero-width / bidi characters / C0-C1 controls
   // eslint-disable-next-line no-control-regex
   let out = md.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2069\u061C\uFEFF]/g, '');
-  // Strip script/style/iframe/svg/object/embed blocks and raw HTML tags
+  // Strip script/style/iframe/svg/object/embed blocks and ALL raw HTML tags
   out = out.replace(/<(script|style|iframe|object|embed|svg)\b[^>]*>[\s\S]*?<\/\1>/gi, '');
-  out = out.replace(/<\/?(script|style|iframe|object|embed|svg|img|link|meta|form|input|button|base|a)\b[^>]*>/gi, '');
-  // Neutralize Markdown remote image tracking pixels
+  out = out.replace(/<\/?[a-z][a-z0-9:-]*(?:\s+[^<>]*)?\/?>/gi, '');
+  // Neutralize inline AND reference-style Markdown remote image tracking pixels
   out = out.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_m, alt: string) => {
     const cleanAlt = (alt || '').trim();
     return cleanAlt ? `[image blocked: ${cleanAlt}]` : '[external image blocked]';
   });
-  // Neutralize dangerous link schemes while preserving safe http(s)/relative links
+  out = out.replace(/!\[([^\]]*)\]\[[^\]]*\]/g, (_m, alt: string) => {
+    const cleanAlt = (alt || '').trim();
+    return cleanAlt ? `[image blocked: ${cleanAlt}]` : '[external image blocked]';
+  });
+  // Neutralize dangerous inline link schemes while preserving safe http(s)/relative links
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (full, label: string, target: string) => {
-    const first = target.trim().split(/\s+/)[0].toLowerCase();
-    if (
-      first.startsWith('https://') ||
-      first.startsWith('http://') ||
-      first.startsWith('#') ||
-      first.startsWith('/')
-    ) {
+    if (isSafeMarkdownTarget(target)) {
       return full;
     }
     return `${label} (unsafe-link-removed)`;
+  });
+  // Neutralize dangerous reference-style link definitions (`[1]: javascript:alert(1)`)
+  out = out.replace(/^[ \t]{0,3}\[([^\]]+)\]:[ \t]*(\S+)(.*)$/gm, (full, id: string, target: string) => {
+    if (isSafeMarkdownTarget(target)) {
+      return full;
+    }
+    return `[${id}]: #unsafe-link-removed`;
   });
   return out;
 }

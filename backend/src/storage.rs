@@ -11,6 +11,7 @@ use crate::models::{
     NetworkTelemetry, SweepDelta, ThreatAlert, ThreatNewsItem, TriageStatus, Vulnerability,
     WebhookTarget,
 };
+use crate::security::{restrict_private_file_permissions, LocalFieldVault};
 use crate::store::ThreatStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,17 +25,18 @@ struct StoreMeta {
 pub struct SqliteStorage {
     db_path: PathBuf,
     conn: Mutex<Connection>,
+    vault: LocalFieldVault,
 }
 
 impl SqliteStorage {
-    /// Opens (or creates) the embedded SQLite database with WAL journaling and 0600 permissions.
+    /// Opens (or creates) the embedded SQLite database with WAL journaling and restrictive permissions.
     pub fn open(db_path: PathBuf) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed creating data directory: {e}"))?;
-            }
-        }
+        let data_dir = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| format!("Failed creating data directory: {e}"))?;
 
         let conn = Connection::open(&db_path)
             .map_err(|e| format!("Failed opening SQLite database {}: {e}", db_path.display()))?;
@@ -48,10 +50,12 @@ impl SqliteStorage {
         .map_err(|e| format!("Failed setting SQLite pragmas: {e}"))?;
 
         restrict_db_permissions(&db_path);
+        let vault = LocalFieldVault::load_or_init(data_dir);
 
         let storage = Self {
             db_path,
             conn: Mutex::new(conn),
+            vault,
         };
         storage.init_schema()?;
         Ok(storage)
@@ -225,7 +229,13 @@ impl SqliteStorage {
         if let Some(fs) = load_kv_json::<FeedSettings>(&conn, "feed_settings")? {
             store.feed_settings = fs;
         }
-        if let Some(hooks) = load_kv_json::<Vec<WebhookTarget>>(&conn, "webhooks")? {
+        if let Some(mut hooks) = load_kv_json::<Vec<WebhookTarget>>(&conn, "webhooks")? {
+            for hook in &mut hooks {
+                let aad = format!("webhook_url:{}", hook.id);
+                if let Ok(decrypted) = self.vault.decrypt_field(&aad, &hook.url) {
+                    hook.url = decrypted;
+                }
+            }
             store.webhooks = hooks;
         }
         if let Some(cti_cfg) = load_kv_json::<crate::cti::CtiConfig>(&conn, "cti_config")? {
@@ -354,7 +364,15 @@ impl SqliteStorage {
         save_kv_json(&tx, "ai_brief", &store.ai_brief, &now_str)?;
         save_kv_json(&tx, "my_stack", &store.my_stack, &now_str)?;
         save_kv_json(&tx, "feed_settings", &store.feed_settings, &now_str)?;
-        save_kv_json(&tx, "webhooks", &store.webhooks, &now_str)?;
+        // Encrypt webhook bearer URLs at rest with AES-256-GCM + per-webhook AAD before writing SQLite
+        let mut encrypted_hooks = store.webhooks.clone();
+        for hook in &mut encrypted_hooks {
+            if !hook.url.trim().is_empty() {
+                let aad = format!("webhook_url:{}", hook.id);
+                hook.url = self.vault.encrypt_field(&aad, &hook.url)?;
+            }
+        }
+        save_kv_json(&tx, "webhooks", &encrypted_hooks, &now_str)?;
         save_kv_json(&tx, "cti_config", &store.cti_config, &now_str)?;
         save_kv_json(&tx, "otx_pulses", &store.otx_pulses, &now_str)?;
         save_kv_json(
@@ -871,16 +889,21 @@ impl SqliteStorage {
 
     pub fn get_auth_user_by_username(&self, username: &str) -> Option<AuthUserRecord> {
         let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT id, username, display_name, password_hash, totp_secret_b32,
-                    totp_enabled, totp_last_step, recovery_hashes_json, created_at, last_login_at
-             FROM auth_users WHERE username = ?1",
-            params![username],
-            map_auth_user_row,
-        )
-        .optional()
-        .ok()
-        .flatten()
+        let mut user = conn
+            .query_row(
+                "SELECT id, username, display_name, password_hash, totp_secret_b32,
+                        totp_enabled, totp_last_step, recovery_hashes_json, created_at, last_login_at
+                 FROM auth_users WHERE username = ?1",
+                params![username],
+                map_auth_user_row,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        if let Some(raw_secret) = user.totp_secret_b32.as_deref() {
+            user.totp_secret_b32 = self.vault.decrypt_field("totp_secret_b32", raw_secret).ok();
+        }
+        Some(user)
     }
 
     pub fn touch_user_last_login(&self, user_id: i64) {
@@ -912,6 +935,7 @@ impl SqliteStorage {
     }
 
     pub fn set_pending_totp_secret(&self, user_id: i64, secret_b32: &str) -> Result<(), String> {
+        let encrypted = self.vault.encrypt_field("totp_secret_b32", secret_b32)?;
         let conn = self
             .conn
             .lock()
@@ -919,7 +943,7 @@ impl SqliteStorage {
         let now_str = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE auth_users SET totp_secret_b32 = ?1, updated_at = ?2 WHERE id = ?3",
-            params![secret_b32, now_str, user_id],
+            params![encrypted, now_str, user_id],
         )
         .map_err(|e| format!("Failed storing pending TOTP secret: {e}"))?;
         Ok(())
@@ -1082,7 +1106,7 @@ impl SqliteStorage {
             return None;
         }
 
-        let user = conn
+        let mut user = conn
             .query_row(
                 "SELECT id, username, display_name, password_hash, totp_secret_b32,
                         totp_enabled, totp_last_step, recovery_hashes_json, created_at, last_login_at
@@ -1093,6 +1117,9 @@ impl SqliteStorage {
             .optional()
             .ok()
             .flatten()?;
+        if let Some(raw_secret) = user.totp_secret_b32.as_deref() {
+            user.totp_secret_b32 = self.vault.decrypt_field("totp_secret_b32", raw_secret).ok();
+        }
 
         let _ = conn.execute(
             "UPDATE auth_sessions SET last_seen_at = ?1 WHERE token_hash = ?2",
@@ -1190,17 +1217,13 @@ impl SqliteStorage {
 }
 
 fn restrict_db_permissions(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
+    restrict_private_file_permissions(path);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if sidecar.exists() {
+            restrict_private_file_permissions(&sidecar);
         }
     }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 #[cfg(test)]
@@ -1302,5 +1325,69 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn sqlite_encrypts_webhook_urls_and_totp_secrets_at_rest() {
+        let dir = std::env::temp_dir().join(format!("abw_enc_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("threat_board.db");
+        let storage = SqliteStorage::open(db_path.clone()).unwrap();
+
+        // 1. Save a webhook with a secret Slack URL and verify raw SQLite ciphertext hides it
+        let secret_url = "https://hooks.slack.com/services/T11111111/B22222222/SUPERSECRETTOKEN99";
+        let mut store = ThreatStore::default();
+        store.webhooks.push(WebhookTarget {
+            id: "wh-test-1".to_string(),
+            name: "SOC Slack".to_string(),
+            kind: crate::models::WebhookKind::Slack,
+            url: secret_url.to_string(),
+            enabled: true,
+            ..Default::default()
+        });
+        storage.save_store(&store).unwrap();
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            let raw_webhooks_json: String = conn
+                .query_row(
+                    "SELECT value_json FROM store_state WHERE key = 'webhooks'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!raw_webhooks_json.contains("SUPERSECRETTOKEN99"));
+            assert!(raw_webhooks_json.contains("enc:v1:"));
+        }
+
+        // Verify load_store transparently decrypts webhook URL back to plaintext
+        let loaded = storage.load_store().unwrap();
+        assert_eq!(loaded.webhooks[0].url, secret_url);
+
+        // 2. Save a TOTP secret and verify raw SQLite column is encrypted at rest
+        let user = storage
+            .create_initial_admin_user("secadmin", "Sec Admin", "hash")
+            .unwrap();
+        let totp_seed = "JBSWY3DPEHPK3PXPJBSWY3DP";
+        storage.set_pending_totp_secret(user.id, totp_seed).unwrap();
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            let raw_totp: String = conn
+                .query_row(
+                    "SELECT totp_secret_b32 FROM auth_users WHERE id = ?1",
+                    params![user.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(raw_totp.starts_with("enc:v1:"));
+            assert!(!raw_totp.contains(totp_seed));
+        }
+
+        let fetched = storage.get_auth_user_by_username("secadmin").unwrap();
+        assert_eq!(fetched.totp_secret_b32.as_deref(), Some(totp_seed));
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

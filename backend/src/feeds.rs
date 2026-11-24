@@ -16,7 +16,10 @@ use crate::models::{
     PhishingUrl, PortAttack, Severity, SseEvent, SweepDelta, ThreatNewsItem, TriageStatus,
     Vulnerability,
 };
-use crate::security::{build_pinned_http_client, validate_outbound_url, OutboundUrlPolicy};
+use crate::security::{
+    build_pinned_http_client, send_ssrf_safe_get, send_ssrf_safe_post_json, validate_outbound_url,
+    OutboundUrlPolicy,
+};
 use crate::stack::correlate_stack;
 use crate::store::AppState;
 use crate::webhooks::{build_dispatch_items, dispatch_webhooks_batch};
@@ -1680,7 +1683,7 @@ fn extract_nvd_cvss(metrics: Option<&Value>) -> (Option<f64>, Option<String>, Op
 // =========================================================================
 // Feed 3: GitHub Security Advisories
 // =========================================================================
-async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHealth) {
+async fn fetch_github_advisories(_http: &reqwest::Client) -> (Vec<Vulnerability>, FeedHealth) {
     let url = "https://api.github.com/advisories?per_page=50";
     let t0 = Instant::now();
     let mut health = base_health(
@@ -1691,17 +1694,17 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
     );
     let now = Utc::now();
 
-    let resp = tokio::time::timeout(
+    let resp = send_ssrf_safe_get(
+        url,
         REQUEST_TIMEOUT,
-        http.get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", USER_AGENT)
-            .send(),
+        USER_AGENT,
+        Some("application/vnd.github+json"),
+        4,
     )
     .await;
 
     match resp {
-        Ok(Ok(r)) => {
+        Ok(r) => {
             let status = r.status().as_u16();
             health.http_status = Some(status);
             health.latency_ms = t0.elapsed().as_millis() as u64;
@@ -1865,16 +1868,10 @@ async fn fetch_github_advisories(http: &reqwest::Client) -> (Vec<Vulnerability>,
                 }
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             health.latency_ms = t0.elapsed().as_millis() as u64;
             health.status = "ERROR".to_string();
-            health.last_error = Some(e.without_url().to_string());
-            (Vec::new(), health)
-        }
-        Err(_) => {
-            health.latency_ms = t0.elapsed().as_millis() as u64;
-            health.status = "ERROR".to_string();
-            health.last_error = Some("Request timeout".to_string());
+            health.last_error = Some(e);
             (Vec::new(), health)
         }
     }
@@ -1960,20 +1957,13 @@ async fn fetch_osv_ai_watchlist(http: &reqwest::Client) -> (Vec<Vulnerability>, 
         .collect();
     let body = serde_json::json!({ "queries": queries });
 
-    let resp = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        http.post(url)
-            .header("User-Agent", USER_AGENT)
-            .json(&body)
-            .send(),
-    )
-    .await;
+    let resp = send_ssrf_safe_post_json(url, REQUEST_TIMEOUT, USER_AGENT, &body).await;
 
     let mut id_set = HashSet::new();
     let mut ids = Vec::new();
 
     match resp {
-        Ok(Ok(r)) => {
+        Ok(r) => {
             let status = r.status().as_u16();
             health.http_status = Some(status);
             if !r.status().is_success() {
@@ -2008,16 +1998,10 @@ async fn fetch_osv_ai_watchlist(http: &reqwest::Client) -> (Vec<Vulnerability>, 
                 }
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             health.latency_ms = t0.elapsed().as_millis() as u64;
             health.status = "ERROR".to_string();
-            health.last_error = Some(e.without_url().to_string());
-            return (Vec::new(), health);
-        }
-        Err(_) => {
-            health.latency_ms = t0.elapsed().as_millis() as u64;
-            health.status = "ERROR".to_string();
-            health.last_error = Some("Timeout".to_string());
+            health.last_error = Some(e);
             return (Vec::new(), health);
         }
     }
@@ -2886,27 +2870,24 @@ async fn fetch_all_rss(
 }
 
 async fn fetch_single_rss(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     def: &RssFeedDef,
 ) -> (Vec<ThreatNewsItem>, FeedHealth) {
     let t0 = Instant::now();
     let mut health = base_health(def.id, def.name, def.category, def.url);
     let now = Utc::now();
 
-    let resp = tokio::time::timeout(
+    let resp = send_ssrf_safe_get(
+        def.url,
         REQUEST_TIMEOUT,
-        http.get(def.url)
-            .header("User-Agent", USER_AGENT)
-            .header(
-                "Accept",
-                "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-            )
-            .send(),
+        USER_AGENT,
+        Some("application/rss+xml, application/atom+xml, application/xml, text/xml, */*"),
+        4,
     )
     .await;
 
     match resp {
-        Ok(Ok(r)) => {
+        Ok(r) => {
             let status = r.status().as_u16();
             health.http_status = Some(status);
             if !r.status().is_success() {
@@ -2993,16 +2974,10 @@ async fn fetch_single_rss(
                 }
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             health.latency_ms = t0.elapsed().as_millis() as u64;
             health.status = "ERROR".to_string();
-            health.last_error = Some(e.without_url().to_string());
-            (Vec::new(), health)
-        }
-        Err(_) => {
-            health.latency_ms = t0.elapsed().as_millis() as u64;
-            health.status = "ERROR".to_string();
-            health.last_error = Some("Request timeout".to_string());
+            health.last_error = Some(e);
             (Vec::new(), health)
         }
     }
@@ -3050,16 +3025,12 @@ async fn read_bounded_bytes(
 }
 
 async fn send_get_json(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     url: &str,
 ) -> Result<(u16, Value), (Option<u16>, String)> {
-    let resp = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        http.get(url).header("User-Agent", USER_AGENT).send(),
-    )
-    .await
-    .map_err(|_| (None, "Request timeout".to_string()))?
-    .map_err(|e| (None, e.without_url().to_string()))?;
+    let resp = send_ssrf_safe_get(url, REQUEST_TIMEOUT, USER_AGENT, None, 4)
+        .await
+        .map_err(|e| (None, e))?;
 
     let status = resp.status().as_u16();
     if !resp.status().is_success() {
@@ -3074,16 +3045,12 @@ async fn send_get_json(
 }
 
 async fn send_get_text(
-    http: &reqwest::Client,
+    _http: &reqwest::Client,
     url: &str,
 ) -> Result<(u16, String), (Option<u16>, String)> {
-    let resp = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        http.get(url).header("User-Agent", USER_AGENT).send(),
-    )
-    .await
-    .map_err(|_| (None, "Request timeout".to_string()))?
-    .map_err(|e| (None, e.without_url().to_string()))?;
+    let resp = send_ssrf_safe_get(url, REQUEST_TIMEOUT, USER_AGENT, None, 4)
+        .await
+        .map_err(|e| (None, e))?;
 
     let status = resp.status().as_u16();
     if !resp.status().is_success() {

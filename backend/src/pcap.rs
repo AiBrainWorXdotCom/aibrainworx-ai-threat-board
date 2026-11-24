@@ -11,6 +11,8 @@ use crate::store::ThreatStore;
 
 pub const MAX_PCAP_BYTES: usize = 25 * 1024 * 1024;
 const MAX_PACKETS: usize = 250_000;
+const MAX_PCAPNG_INTERFACES: usize = 1_024;
+const MAX_PCAPNG_BLOCKS: usize = 300_000;
 const MAX_UNIQUE_ENDPOINTS: usize = 5_000;
 const MAX_UNIQUE_DOMAINS: usize = 5_000;
 const MAX_DNS_POINTER_HOPS: usize = 16;
@@ -847,8 +849,15 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
     let mut offset = 0usize;
     let mut le = true;
     let mut interfaces: Vec<u32> = Vec::new();
+    let mut blocks_seen = 0usize;
 
-    while offset + 12 <= data.len() {
+    while offset.checked_add(12).is_some_and(|end| end <= data.len()) {
+        if blocks_seen >= MAX_PCAPNG_BLOCKS {
+            acc.packets_truncated = true;
+            break;
+        }
+        blocks_seen += 1;
+
         // Section Header Block type is 0x0A0D0D0A (palindromic across endianness!)
         let raw_type = u32::from_le_bytes([
             data[offset],
@@ -857,7 +866,7 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
             data[offset + 3],
         ]);
         if raw_type == 0x0A0D0D0A {
-            if offset + 28 > data.len() {
+            if offset.checked_add(28).is_none_or(|end| end > data.len()) {
                 break;
             }
             let bom = u32::from_le_bytes([
@@ -880,15 +889,20 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
         let Some(block_len) = read_u32(data, offset + 4, le).map(|v| v as usize) else {
             break;
         };
-        if block_len < 12 || !block_len.is_multiple_of(4) || offset + block_len > data.len() {
+        let Some(block_end) = offset.checked_add(block_len) else {
+            break;
+        };
+        if block_len < 12 || !block_len.is_multiple_of(4) || block_end > data.len() {
             break;
         }
 
         match block_type {
-            // Interface Description Block (IDB)
+            // Interface Description Block (IDB) — bounded to prevent memory exhaustion
             0x00000001 => {
-                if let Some(lt) = read_u16(data, offset + 8, le) {
-                    interfaces.push(lt as u32);
+                if interfaces.len() < MAX_PCAPNG_INTERFACES {
+                    if let Some(lt) = read_u16(data, offset + 8, le) {
+                        interfaces.push(lt as u32);
+                    }
                 }
             }
             // Enhanced Packet Block (EPB)
@@ -896,10 +910,11 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
                 let iface_id = read_u32(data, offset + 8, le).unwrap_or(0) as usize;
                 let cap_len = read_u32(data, offset + 20, le).unwrap_or(0) as usize;
                 let lt = interfaces.get(iface_id).copied().unwrap_or(1);
-                let pkt_start = offset + 28;
-                if let Some(pkt_end) = pkt_start.checked_add(cap_len) {
-                    if pkt_end <= offset + block_len - 4 {
-                        acc.process_frame(lt, &data[pkt_start..pkt_end]);
+                if let Some(pkt_start) = offset.checked_add(28) {
+                    if let Some(pkt_end) = pkt_start.checked_add(cap_len) {
+                        if pkt_end <= block_end - 4 {
+                            acc.process_frame(lt, &data[pkt_start..pkt_end]);
+                        }
                     }
                 }
             }
@@ -907,17 +922,18 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
             0x00000003 if block_len >= 16 => {
                 let orig_len = read_u32(data, offset + 8, le).unwrap_or(0) as usize;
                 let lt = interfaces.first().copied().unwrap_or(1);
-                let pkt_start = offset + 12;
-                let avail = (offset + block_len - 4).saturating_sub(pkt_start);
-                let cap_len = orig_len.min(avail);
-                if cap_len > 0 {
-                    acc.process_frame(lt, &data[pkt_start..pkt_start + cap_len]);
+                if let Some(pkt_start) = offset.checked_add(12) {
+                    let avail = (block_end - 4).saturating_sub(pkt_start);
+                    let cap_len = orig_len.min(avail);
+                    if cap_len > 0 {
+                        acc.process_frame(lt, &data[pkt_start..pkt_start + cap_len]);
+                    }
                 }
             }
             _ => {}
         }
 
-        offset += block_len;
+        offset = block_end;
         if acc.packets_truncated {
             break;
         }
@@ -925,12 +941,84 @@ fn parse_pcapng(data: &[u8], acc: &mut PcapAccumulator) -> Result<(), String> {
     Ok(())
 }
 
+/// Owned snapshot of live CTI lookup tables for lock-free PCAP correlation inside
+/// `tokio::task::spawn_blocking`, keeping CPU-heavy packet parsing off async workers.
+#[derive(Debug, Clone, Default)]
+pub struct PcapThreatIndex {
+    c2_by_ip: HashMap<String, (String, u16, String)>,
+    c2_by_host: HashMap<String, (String, String)>,
+    sans_by_ip: HashMap<String, (u64, u64)>,
+    phish_by_domain: HashMap<String, String>,
+    compromised_ips_set: HashSet<String>,
+    otx_ip_pulses: HashMap<String, Vec<String>>,
+    otx_domain_pulses: HashMap<String, Vec<String>>,
+}
+
+impl PcapThreatIndex {
+    pub fn from_store(store: &ThreatStore) -> Self {
+        let mut c2_by_ip = HashMap::with_capacity(store.telemetry.botnet_c2s.len());
+        let mut c2_by_host = HashMap::new();
+        for c2 in &store.telemetry.botnet_c2s {
+            c2_by_ip.insert(
+                c2.ip_address.trim().to_string(),
+                (
+                    c2.malware.clone(),
+                    c2.port,
+                    c2.country.clone().unwrap_or_else(|| "--".to_string()),
+                ),
+            );
+            if let Some(h) = c2.hostname.as_deref() {
+                let hl = h.trim().to_ascii_lowercase();
+                if !hl.is_empty() {
+                    c2_by_host.insert(hl, (c2.malware.clone(), c2.ip_address.clone()));
+                }
+            }
+        }
+        let mut sans_by_ip = HashMap::with_capacity(store.telemetry.top_attacking_ips.len());
+        for ip in &store.telemetry.top_attacking_ips {
+            sans_by_ip.insert(ip.ip.trim().to_string(), (ip.attacks, ip.count));
+        }
+        let mut phish_by_domain = HashMap::with_capacity(store.telemetry.phishing_urls.len());
+        for ph in &store.telemetry.phishing_urls {
+            let dom = ph.domain.trim().to_ascii_lowercase();
+            if !dom.is_empty() {
+                phish_by_domain.insert(
+                    dom,
+                    ph.suspected_brand
+                        .clone()
+                        .unwrap_or_else(|| "Phishing".to_string()),
+                );
+            }
+        }
+        Self {
+            c2_by_ip,
+            c2_by_host,
+            sans_by_ip,
+            phish_by_domain,
+            compromised_ips_set: store.compromised_ips_set.clone(),
+            otx_ip_pulses: store.otx_pulses.ip_pulses.clone(),
+            otx_domain_pulses: store.otx_pulses.domain_pulses.clone(),
+        }
+    }
+}
+
 /// Parses raw `.pcap` or `.pcapng` bytes strictly in memory and correlates extracted IPs,
 /// DNS queries, TLS SNIs, HTTP hosts, and ports against live `ThreatStore` intelligence.
+#[allow(dead_code)]
 pub fn analyze_pcap_bytes(
     filename: &str,
     data: &[u8],
     store: &ThreatStore,
+) -> Result<PcapAnalysisReport, String> {
+    let idx = PcapThreatIndex::from_store(store);
+    analyze_pcap_bytes_with_index(filename, data, &idx)
+}
+
+/// CPU-only variant safe to execute on `tokio::task::spawn_blocking` without holding `ThreatStore`.
+pub fn analyze_pcap_bytes_with_index(
+    filename: &str,
+    data: &[u8],
+    idx: &PcapThreatIndex,
 ) -> Result<PcapAnalysisReport, String> {
     let t0 = Instant::now();
     if data.is_empty() {
@@ -961,37 +1049,6 @@ pub fn analyze_pcap_bytes(
         );
     };
 
-    // Build fast threat correlation lookup indices from live ThreatStore
-    let mut c2_by_ip: HashMap<String, (&str, u16, &str)> = HashMap::new();
-    let mut c2_by_host: HashMap<String, (&str, &str)> = HashMap::new();
-    for c2 in &store.telemetry.botnet_c2s {
-        c2_by_ip.insert(
-            c2.ip_address.trim().to_string(),
-            (
-                c2.malware.as_str(),
-                c2.port,
-                c2.country.as_deref().unwrap_or("--"),
-            ),
-        );
-        if let Some(h) = c2.hostname.as_deref() {
-            let hl = h.trim().to_ascii_lowercase();
-            if !hl.is_empty() {
-                c2_by_host.insert(hl, (c2.malware.as_str(), c2.ip_address.as_str()));
-            }
-        }
-    }
-    let mut sans_by_ip: HashMap<String, (u64, u64)> = HashMap::new();
-    for ip in &store.telemetry.top_attacking_ips {
-        sans_by_ip.insert(ip.ip.trim().to_string(), (ip.attacks, ip.count));
-    }
-    let mut phish_by_domain: HashMap<String, &str> = HashMap::new();
-    for ph in &store.telemetry.phishing_urls {
-        let dom = ph.domain.trim().to_ascii_lowercase();
-        if !dom.is_empty() {
-            phish_by_domain.insert(dom, ph.suspected_brand.as_deref().unwrap_or("Phishing"));
-        }
-    }
-
     let mut malicious_hits: Vec<PcapMaliciousHit> = Vec::new();
     let mut top_external_ips: Vec<PcapEndpointStat> = Vec::new();
 
@@ -1002,13 +1059,13 @@ pub fn analyze_pcap_bytes(
         let mut ind_type = "External IP";
         let mut severity = "MEDIUM";
 
-        if let Some((malware, c2_port, country)) = c2_by_ip.get(&ip_str) {
+        if let Some((malware, c2_port, country)) = idx.c2_by_ip.get(&ip_str) {
             feeds.push("abuse.ch Feodo Tracker".to_string());
             details.push(format!("Botnet C2 ({malware}, port {c2_port}, {country})"));
             ind_type = "Botnet C2";
             severity = "CRITICAL";
         }
-        if let Some((attacks, packets)) = sans_by_ip.get(&ip_str) {
+        if let Some((attacks, packets)) = idx.sans_by_ip.get(&ip_str) {
             feeds.push("SANS ISC Top Attackers".to_string());
             details.push(format!("Scanner IP ({attacks} attacks, {packets} packets)"));
             if severity != "CRITICAL" {
@@ -1016,7 +1073,7 @@ pub fn analyze_pcap_bytes(
                 severity = "HIGH";
             }
         }
-        if store.compromised_ips_set.contains(&ip_str) {
+        if idx.compromised_ips_set.contains(&ip_str) {
             feeds.push("Emerging Threats Blocklist".to_string());
             details.push("Present in Emerging Threats compromised-ips blocklist".to_string());
             if severity == "MEDIUM" {
@@ -1024,7 +1081,7 @@ pub fn analyze_pcap_bytes(
                 severity = "HIGH";
             }
         }
-        if let Some(pulses) = store.otx_pulses.ip_pulses.get(&ip_str) {
+        if let Some(pulses) = idx.otx_ip_pulses.get(&ip_str) {
             feeds.push("AlienVault / LevelBlue OTX".to_string());
             details.push(format!("OTX Pulses: {}", pulses.join(" · ")));
             if severity == "MEDIUM" {
@@ -1038,7 +1095,8 @@ pub fn analyze_pcap_bytes(
         ports.truncate(8);
         let mut protos: Vec<String> = stat.protocols.iter().map(|s| (*s).to_string()).collect();
         protos.sort();
-        let preferred_port = c2_by_ip
+        let preferred_port = idx
+            .c2_by_ip
             .get(&ip_str)
             .map(|(_, c2_port, _)| *c2_port)
             .or_else(|| {
@@ -1094,24 +1152,28 @@ pub fn analyze_pcap_bytes(
         let mut hit_type = "Phishing Domain";
         let mut severity = "HIGH";
 
-        if let Some((malware, c2_ip)) = c2_by_host.get(host) {
+        if let Some((malware, c2_ip)) = idx.c2_by_host.get(host) {
             feeds.push("abuse.ch Feodo Tracker".to_string());
             details.push(format!("C2 hostname for {malware} ({c2_ip})"));
             hit_type = "C2 Hostname";
             severity = "CRITICAL";
         }
         // Check exact or parent domain against OpenPhish
-        let phish_match = phish_by_domain.get(host).copied().or_else(|| {
-            host.split_once('.')
-                .and_then(|(_, parent)| phish_by_domain.get(parent).copied())
-        });
+        let phish_match = idx
+            .phish_by_domain
+            .get(host)
+            .map(String::as_str)
+            .or_else(|| {
+                host.split_once('.')
+                    .and_then(|(_, parent)| idx.phish_by_domain.get(parent).map(String::as_str))
+            });
         if let Some(brand) = phish_match {
             feeds.push("OpenPhish".to_string());
             details.push(format!("Active phishing campaign domain ({brand})"));
         }
-        let otx_dom_match = store.otx_pulses.domain_pulses.get(host).or_else(|| {
+        let otx_dom_match = idx.otx_domain_pulses.get(host).or_else(|| {
             host.split_once('.')
-                .and_then(|(_, parent)| store.otx_pulses.domain_pulses.get(parent))
+                .and_then(|(_, parent)| idx.otx_domain_pulses.get(parent))
         });
         if let Some(pulses) = otx_dom_match {
             feeds.push("AlienVault / LevelBlue OTX".to_string());
@@ -1701,5 +1763,31 @@ mod tests {
     fn rejects_non_pcap_garbage_and_oversized_inputs() {
         let store = ThreatStore::default();
         assert!(analyze_pcap_bytes("bad.txt", b"not a pcap file at all here!!", &store).is_err());
+    }
+
+    #[test]
+    fn pcapng_idb_flood_is_strictly_bounded() {
+        let store = ThreatStore::default();
+        let mut ng = Vec::with_capacity(28 + 20 * 5000);
+        // Valid SHB (28 bytes)
+        ng.extend_from_slice(&0x0A0D0D0Au32.to_le_bytes());
+        ng.extend_from_slice(&28u32.to_le_bytes());
+        ng.extend_from_slice(&0x1A2B3C4Du32.to_le_bytes());
+        ng.extend_from_slice(&1u16.to_le_bytes());
+        ng.extend_from_slice(&0u16.to_le_bytes());
+        ng.extend_from_slice(&(-1i64).to_le_bytes());
+        ng.extend_from_slice(&28u32.to_le_bytes());
+        // Flood with 5,000 back-to-back 20-byte IDBs (exceeds MAX_PCAPNG_INTERFACES = 1024)
+        for _ in 0..5000 {
+            ng.extend_from_slice(&0x00000001u32.to_le_bytes());
+            ng.extend_from_slice(&20u32.to_le_bytes());
+            ng.extend_from_slice(&1u16.to_le_bytes());
+            ng.extend_from_slice(&0u16.to_le_bytes());
+            ng.extend_from_slice(&65535u32.to_le_bytes());
+            ng.extend_from_slice(&20u32.to_le_bytes());
+        }
+        let report = analyze_pcap_bytes("idb-flood.pcapng", &ng, &store).unwrap();
+        assert_eq!(report.format, "PCAPNG");
+        assert_eq!(report.packets_parsed, 0);
     }
 }

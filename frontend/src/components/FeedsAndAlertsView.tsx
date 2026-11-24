@@ -81,6 +81,7 @@ export function FeedsAndAlertsView({
   const [whKevOnly, setWhKevOnly] = useState(false);
   const [whStackOnly, setWhStackOnly] = useState(false);
   const [whSecret, setWhSecret] = useState('');
+  const [whSaveKeychain, setWhSaveKeychain] = useState(false);
   const [whError, setWhError] = useState<string | null>(null);
   const [whTestMsg, setWhTestMsg] = useState<string | null>(null);
 
@@ -170,10 +171,12 @@ export function FeedsAndAlertsView({
         kev_only: whKevOnly,
         stack_only: whStackOnly,
         signing_secret: whSecret.trim() || undefined,
+        save_secret_to_keychain: whSecret.trim() ? whSaveKeychain : false,
       });
       setWhName('');
       setWhUrl('');
       setWhSecret('');
+      setWhSaveKeychain(false);
       reloadSettingsAndHooks();
     } catch (e) {
       setWhError(e instanceof Error ? e.message : String(e));
@@ -541,9 +544,20 @@ export function FeedsAndAlertsView({
                 disabled={readOnly}
                 value={whSecret}
                 onChange={(e) => setWhSecret(e.target.value)}
-                placeholder="Optional HMAC-SHA256 Secret"
+                placeholder="Optional HMAC-SHA256 Secret (RAM-only by default)"
                 style={{ flex: '1 1 160px' }}
               />
+              {whSecret.trim().length > 0 && (
+                <label style={{ display: 'inline-flex', gap: 5, alignItems: 'center' }}>
+                  <input
+                    type="checkbox"
+                    checked={whSaveKeychain}
+                    disabled={readOnly}
+                    onChange={(e) => setWhSaveKeychain(e.target.checked)}
+                  />
+                  Save Secret to OS Keychain
+                </label>
+              )}
               <Button
                 label="Add Webhook"
                 size="sm"

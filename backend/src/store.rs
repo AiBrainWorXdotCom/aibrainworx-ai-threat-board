@@ -27,6 +27,7 @@ pub struct ServerModeConfig {
     pub no_auth_mode: bool,
     pub auth_token: Option<String>,
     pub bind_addr: String,
+    pub trust_proxy_headers: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

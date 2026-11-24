@@ -97,6 +97,19 @@ interface ParsedSurface {
   components: Map<string, A2uiComponentNode>;
 }
 
+const BLOCKED_POINTER_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const ALLOWED_KPI_TONES = new Set([
+  'neutral',
+  'critical',
+  'high',
+  'medium',
+  'low',
+  'success',
+  'info',
+  'warning',
+  'error',
+]);
+
 /** Resolve an RFC 6901 JSON Pointer (`/a/b/0`) against the surface's `dataModel`. */
 function resolvePointer(root: unknown, pointer: string): unknown {
   if (!pointer || pointer === '/') return root;
@@ -107,12 +120,13 @@ function resolvePointer(root: unknown, pointer: string): unknown {
     .map((seg) => seg.replace(/~1/g, '/').replace(/~0/g, '~'));
   let cur: unknown = root;
   for (const part of parts) {
-    if (cur == null) return undefined;
+    if (cur == null || BLOCKED_POINTER_KEYS.has(part)) return undefined;
     if (Array.isArray(cur)) {
       const idx = Number(part);
       if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return undefined;
       cur = cur[idx];
     } else if (typeof cur === 'object') {
+      if (!Object.prototype.hasOwnProperty.call(cur, part)) return undefined;
       cur = (cur as Record<string, unknown>)[part];
     } else {
       return undefined;
@@ -389,10 +403,13 @@ export function A2uiRenderer({
           <div key={node.id} className="abw-a2ui-kpi-grid">
             {rawItems.slice(0, 6).map((item, idx) => {
               const obj = (item ?? {}) as Record<string, unknown>;
-              const tone = typeof obj.tone === 'string' ? obj.tone : 'neutral';
+              const rawTone = typeof obj.tone === 'string' ? obj.tone.trim().toLowerCase() : 'neutral';
+              const tone = ALLOWED_KPI_TONES.has(rawTone) ? rawTone : 'neutral';
               return (
                 <div key={idx} className={`abw-a2ui-kpi abw-a2ui-kpi-${tone}`}>
-                  <span className="abw-a2ui-kpi-label">{String(obj.label ?? '')}</span>
+                  <span className="abw-a2ui-kpi-label">
+                    {redactDisplayText(String(obj.label ?? ''), opsecMode)}
+                  </span>
                   <span className="abw-a2ui-kpi-value">{String(obj.value ?? '—')}</span>
                   <span className="abw-a2ui-kpi-detail">
                     {redactDisplayText(String(obj.detail ?? ''), opsecMode)}
@@ -499,13 +516,19 @@ export function A2uiRenderer({
         const series = rawSeries.slice(0, 8).map((item) => {
           const obj = (item ?? {}) as Record<string, unknown>;
           return {
-            name: String(obj.name ?? ''),
+            name: redactDisplayText(String(obj.name ?? ''), opsecMode),
             value: Number(obj.value ?? 0),
-            detail: typeof obj.detail === 'string' ? obj.detail : '',
+            detail: redactDisplayText(typeof obj.detail === 'string' ? obj.detail : '', opsecMode),
           };
         });
-        const title = typeof props.title === 'string' ? props.title : 'Risk & Telemetry Profile';
-        const subtitle = typeof props.subtitle === 'string' ? props.subtitle : '';
+        const title = redactDisplayText(
+          typeof props.title === 'string' ? props.title : 'Risk & Telemetry Profile',
+          opsecMode
+        );
+        const subtitle = redactDisplayText(
+          typeof props.subtitle === 'string' ? props.subtitle : '',
+          opsecMode
+        );
         const unit = typeof props.unit === 'string' ? props.unit : '';
         const fill = accentHex(typeof props.accent === 'string' ? props.accent : undefined);
 

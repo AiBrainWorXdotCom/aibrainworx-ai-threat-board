@@ -713,6 +713,8 @@ pub struct WebhookTarget {
     #[serde(skip)]
     pub signing_secret: String,
     pub has_signing_secret: bool,
+    #[serde(default)]
+    pub save_secret_to_keychain: bool,
     pub last_status: Option<String>,
     pub last_sent_at: Option<DateTime<Utc>>,
     pub failure_count: u32,
@@ -731,6 +733,7 @@ impl Default for WebhookTarget {
             stack_only: false,
             signing_secret: String::new(),
             has_signing_secret: false,
+            save_secret_to_keychain: false,
             last_status: None,
             last_sent_at: None,
             failure_count: 0,
@@ -749,6 +752,7 @@ pub struct WebhookTargetPublic {
     pub kev_only: bool,
     pub stack_only: bool,
     pub has_signing_secret: bool,
+    pub save_secret_to_keychain: bool,
     pub last_status: Option<String>,
     pub last_sent_at: Option<DateTime<Utc>>,
     pub failure_count: u32,
@@ -764,6 +768,7 @@ pub struct WebhookCreateRequest {
     pub kev_only: Option<bool>,
     pub stack_only: Option<bool>,
     pub signing_secret: Option<String>,
+    pub save_secret_to_keychain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -772,6 +777,10 @@ pub struct WebhookUpdateRequest {
     pub min_severity: Option<Severity>,
     pub kev_only: Option<bool>,
     pub stack_only: Option<bool>,
+    pub url: Option<String>,
+    pub signing_secret: Option<String>,
+    pub clear_signing_secret: Option<bool>,
+    pub save_secret_to_keychain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -901,6 +910,8 @@ pub struct AuthSetupRequest {
     #[serde(default)]
     pub display_name: String,
     pub password: String,
+    #[serde(default)]
+    pub setup_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -201,7 +201,14 @@ pub fn export_stix_bundle(
 
     let mut seen_patterns = HashSet::new();
     for c2 in c2s.iter().take(200) {
-        let pattern = format!("[ipv4-addr:value = '{}']", c2.ip_address.replace('\'', ""));
+        let Ok(parsed_ip) = c2.ip_address.trim().parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let obj_type = match parsed_ip {
+            std::net::IpAddr::V4(_) => "ipv4-addr",
+            std::net::IpAddr::V6(_) => "ipv6-addr",
+        };
+        let pattern = format!("[{obj_type}:value = '{parsed_ip}']");
         if !seen_patterns.insert(pattern.clone()) {
             continue;
         }
@@ -222,7 +229,14 @@ pub fn export_stix_bundle(
     }
 
     for atk in attackers.iter().take(200) {
-        let pattern = format!("[ipv4-addr:value = '{}']", atk.ip.replace('\'', ""));
+        let Ok(parsed_ip) = atk.ip.trim().parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let obj_type = match parsed_ip {
+            std::net::IpAddr::V4(_) => "ipv4-addr",
+            std::net::IpAddr::V6(_) => "ipv6-addr",
+        };
+        let pattern = format!("[{obj_type}:value = '{parsed_ip}']");
         if !seen_patterns.insert(pattern.clone()) {
             continue;
         }
@@ -281,6 +295,12 @@ pub fn export_iocs_blocklist(
 
     for c2 in &telemetry.botnet_c2s {
         if let Ok(ip) = c2.ip_address.trim().parse::<std::net::IpAddr>() {
+            if !crate::security::is_ip_allowed(
+                ip,
+                crate::security::OutboundUrlPolicy::StrictPublicHttps,
+            ) {
+                continue;
+            }
             let s = ip.to_string();
             if seen.insert(s.clone()) {
                 unique_ips.push(s);
@@ -289,6 +309,12 @@ pub fn export_iocs_blocklist(
     }
     for atk in &telemetry.top_attacking_ips {
         if let Ok(ip) = atk.ip.trim().parse::<std::net::IpAddr>() {
+            if !crate::security::is_ip_allowed(
+                ip,
+                crate::security::OutboundUrlPolicy::StrictPublicHttps,
+            ) {
+                continue;
+            }
             let s = ip.to_string();
             if seen.insert(s.clone()) {
                 unique_ips.push(s);
@@ -516,5 +542,28 @@ mod tests {
             .insert("CVE-2099-9999".to_string());
         let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
         assert!(verify_offline_snapshot(&tampered_bytes).is_err());
+    }
+
+    #[test]
+    fn blocklist_exports_strip_private_loopback_and_metadata_ips() {
+        let mut telemetry = NetworkTelemetry::default();
+        for ip in ["127.0.0.1", "10.0.0.5", "169.254.169.254", "93.184.216.34"] {
+            telemetry.top_attacking_ips.push(AttackerIp {
+                ip: ip.to_string(),
+                count: 100,
+                attacks: 50,
+                first_seen: String::new(),
+                last_seen: String::new(),
+            });
+        }
+        let (edl, _, _) = export_iocs_blocklist("edl", &telemetry).unwrap();
+        assert!(edl.contains("93.184.216.34"));
+        assert!(!edl.contains("127.0.0.1"));
+        assert!(!edl.contains("10.0.0.5"));
+        assert!(!edl.contains("169.254.169.254"));
+
+        let (nft, _, _) = export_iocs_blocklist("nftables", &telemetry).unwrap();
+        assert!(nft.contains("93.184.216.34"));
+        assert!(!nft.contains("127.0.0.1"));
     }
 }

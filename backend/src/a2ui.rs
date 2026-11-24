@@ -15,6 +15,7 @@ pub const A2UI_CATALOG_ID: &str = "aibrainworx.soc.v1";
 
 const MAX_COMPONENTS: usize = 40;
 const MAX_JSON_DEPTH: usize = 8;
+const MAX_COMPONENT_TREE_DEPTH: usize = 6;
 const MAX_ARRAY_ITEMS: usize = 64;
 const MAX_STRING_LEN: usize = 4096;
 
@@ -1964,6 +1965,13 @@ pub fn validate_and_sanitize_a2ui(
                 {
                     return Err("A2UI component graph contains a cycle".to_string());
                 }
+                if !root_id.is_empty()
+                    && max_tree_depth(&root_id, &children_map, 0) > MAX_COMPONENT_TREE_DEPTH
+                {
+                    return Err(format!(
+                        "A2UI component graph exceeds maximum render depth ({MAX_COMPONENT_TREE_DEPTH})"
+                    ));
+                }
 
                 sanitized_messages.push(A2uiServerMessage::UpdateComponents {
                     surface_id: clean_text(&surface_id, 64),
@@ -1979,6 +1987,22 @@ pub fn validate_and_sanitize_a2ui(
 
     payload.messages = sanitized_messages;
     Ok(payload)
+}
+
+fn max_tree_depth(node: &str, adj: &HashMap<&str, Vec<&str>>, depth: usize) -> usize {
+    if depth > MAX_COMPONENT_TREE_DEPTH {
+        return depth;
+    }
+    let mut deepest = depth;
+    if let Some(kids) = adj.get(node) {
+        for &k in kids {
+            deepest = deepest.max(max_tree_depth(k, adj, depth + 1));
+            if deepest > MAX_COMPONENT_TREE_DEPTH {
+                break;
+            }
+        }
+    }
+    deepest
 }
 
 fn has_cycle<'a>(
@@ -2276,5 +2300,42 @@ mod tests {
         let p = patch.expect("patch parsed");
         assert_eq!(p.headline.as_deref(), Some("Custom SOC Focus"));
         assert_eq!(p.playbook.len(), 1);
+    }
+
+    #[test]
+    fn validator_rejects_component_tree_exceeding_max_render_depth() {
+        let mut comps = Vec::new();
+        for i in 0..=8 {
+            comps.push(A2uiComponent {
+                id: format!("n{i}"),
+                component: "Column".to_string(),
+                children: if i < 8 {
+                    Some(vec![format!("n{}", i + 1)])
+                } else {
+                    None
+                },
+                props: Map::new(),
+            });
+        }
+        let deep = A2uiSurfacePayload {
+            version: "1.0".to_string(),
+            surface_id: "deep1".to_string(),
+            catalog_id: A2UI_CATALOG_ID.to_string(),
+            intent: "test".to_string(),
+            messages: vec![
+                A2uiServerMessage::CreateSurface {
+                    surface_id: "deep1".to_string(),
+                    catalog_id: A2UI_CATALOG_ID.to_string(),
+                    root_component_id: "n0".to_string(),
+                    title: "Deep".to_string(),
+                    subtitle: "".to_string(),
+                },
+                A2uiServerMessage::UpdateComponents {
+                    surface_id: "deep1".to_string(),
+                    components: comps,
+                },
+            ],
+        };
+        assert!(validate_and_sanitize_a2ui(deep).is_err());
     }
 }

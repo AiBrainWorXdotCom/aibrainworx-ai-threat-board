@@ -53,13 +53,15 @@ Once built (or downloaded from **GitHub Releases**), `aibrainworx-threat-board` 
 ```bash
 ./aibrainworx-threat-board
 # Optional flags:
-#   --wallboard         Read-only kiosk display mode (403 on mutations)
-#   --offline           Air-gapped mode (disables outbound feed sweeps; use Snapshot Import)
-#   --no-auth           Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)
-#   --reset-auth        Clear local admin password & 2FA secrets to return to first-run setup
-#   --bind <IP>         Bind interface (non-loopback enforces authentication)
-#   --port <PORT>       Listen port (default 8080)
-#   --data-dir <PATH>   Custom SQLite database directory (default ./data)
+#   --wallboard              Read-only kiosk display mode (403 on mutations)
+#   --offline                Air-gapped mode (disables outbound feed sweeps; use Snapshot Import)
+#   --no-auth                Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)
+#   --reset-auth             Clear local admin password & 2FA secrets to return to first-run setup
+#   --allowed-hosts <CSV>    Explicit Host allowlist for wildcard --bind 0.0.0.0 / :: DNS-rebinding defense
+#   --trust-proxy            Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy (off by default)
+#   --bind <IP>              Bind interface (non-loopback enforces authentication)
+#   --port <PORT>            Listen port (default 8080)
+#   --data-dir <PATH>        Custom SQLite database directory (default ./data)
 ```
 
 Or run the multi-stage hardened container (`non-root`, `/data` volume, `HEALTHCHECK`):
@@ -286,16 +288,23 @@ flowchart LR
 ```
 
 ### Core Architecture & Stack
-- **Pure Rust Backend (`backend/`):** Built with Rust (`edition 2021`), `axum 0.8`, `tokio`, `reqwest 0.12`, `rusqlite 0.32` (bundled SQLite WAL + FTS5), `rust-embed 8`, `argon2 0.5`, `qrcode 0.14`, `keyring 3`, `sha2`/`sha1`/`hmac`, `feed-rs 2`, `serde`, and `tower-http 0.6`.
+- **Pure Rust Backend (`backend/`):** Built with Rust (`edition 2021`), `axum 0.8`, `tokio`, `reqwest 0.12`, `rusqlite 0.32` (bundled SQLite WAL + FTS5), `rust-embed 8`, `aes-gcm 0.10`, `argon2 0.5`, `qrcode 0.14`, `keyring 3`, `sha2`/`sha1`/`hmac`, `feed-rs 2`, `serde`, and `tower-http 0.6`.
   - **Optional BYO CTI Enrichment & OTX Pulse Sync (`backend/src/cti.rs`):** Opt-in on-demand indicator enrichment across AlienVault/LevelBlue OTX, GreyNoise Community, AbuseIPDB v2, and VirusTotal v3 behind a strict Privacy Guard (blocking RFC1918/private IPs & internal domains), DNS-pinned zero-redirect HTTPS, `#[serde(skip)]` RAM/Keychain secrets, local OTX Subscribed Pulse syncing (`15,000` indicators/pulse cap), and 24-hour SQLite verdict caching.
-  - **Pure-Rust Offline Wireshark PCAP/PCAPNG Engine (`backend/src/pcap.rs`):** Zero-dependency, zero-`unsafe` packet parser for classic `.pcap` and Wireshark `.pcapng` captures (Ethernet/VLAN/SLL/SLL2/Raw/Null → IPv4/IPv6 → TCP/UDP → DNS `QNAME`, TLS ClientHello SNI, HTTP `Host`/`User-Agent`) with live CTI & local OTX correlation, behavioral heuristics (port scans, DNS tunneling, cleartext protocols), and ready-to-paste Wireshark display filter generation.
-  - **A2UI 1.0 Protocol Engine & Validator (`backend/src/a2ui.rs`):** Emits declarative A2UI 1.0 `agent_to_renderer` surfaces (`createSurface`, `updateDataModel`, `updateComponents`, `@path` JSON Pointer bindings) tailored to analyst queries, single-CVE triage, and PCAP incidents; validates optional external-LLM `a2ui-patch` blocks against a strict component/action allowlist, rejects cyclic graphs or unsafe URIs, and guarantees zero raw HTML execution.
-  - **Local Authentication & 2FA (`backend/src/auth.rs`):** OWASP Argon2id password hashing (`m=19456, t=2, p=1`), timing-resistant dummy verification, 256-bit CSPRNG `HttpOnly; SameSite=Strict` SQLite sessions (SHA-256 hashed at rest), progressive brute-force lockout (`429 Retry-After`), RFC 6238 TOTP with replay protection, local offline base64 SVG QR generation, and 8 single-use hashed recovery codes.
-  - **Security & Keychain Layer (`backend/src/security.rs`):** DNS-pinned outbound SSRF validator (`validate_outbound_url` + IPv4-mapped IPv6 unwrapping + `Policy::none()`), invisible Unicode/bidi/Tag stripper, Markdown XSS/tracking-pixel sanitizer, CSPRNG token & constant-time compare helpers, and optional OS native Keychain integration.
-  - **Embedded SQLite + FTS5 & Migration (`backend/src/storage.rs`):** Persists CVEs, triage states, 14-day EPSS history, sweep delta snapshots, local OTX pulses, 24h CTI enrichment cache, and local auth tables (`auth_users`, `auth_sessions`) in `data/threat_board.db` (`0600` Unix permissions) and auto-migrates legacy `data/threat_store.json`.
+  - **Pure-Rust Offline Wireshark PCAP/PCAPNG Engine (`backend/src/pcap.rs`):** Zero-dependency, zero-`unsafe` packet parser for classic `.pcap` and Wireshark `.pcapng` captures (Ethernet/VLAN/SLL/SLL2/Raw/Null → IPv4/IPv6 → TCP/UDP → DNS `QNAME`, TLS ClientHello SNI, HTTP `Host`/`User-Agent`) offloaded to `spawn_blocking` with live CTI & local OTX correlation, strict IDB/block/packet anti-DoS bounds, behavioral heuristics (port scans, DNS tunneling, cleartext protocols), and ready-to-paste Wireshark display filter generation.
+  - **A2UI 1.0 Protocol Engine & Validator (`backend/src/a2ui.rs`):** Emits declarative A2UI 1.0 `agent_to_renderer` surfaces (`createSurface`, `updateDataModel`, `updateComponents`, `@path` JSON Pointer bindings) tailored to analyst queries, single-CVE triage, and PCAP incidents; validates optional external-LLM `a2ui-patch` blocks against a strict component/action allowlist, rejects cyclic/deep graphs or unsafe URIs, and guarantees zero raw HTML execution.
+  - **Local Authentication & 2FA (`backend/src/auth.rs`):** OWASP Argon2id password hashing (`m=19456, t=2, p=1`), timing-resistant dummy verification, 256-bit CSPRNG `HttpOnly; SameSite=Strict` SQLite sessions (SHA-256 hashed at rest), `ConnectInfo`-based progressive brute-force lockout (`429 Retry-After`), RFC 6238 TOTP with replay protection & AES-256-GCM at-rest seed encryption, local offline base64 SVG QR generation, and 8 single-use hashed recovery codes.
+  - **Security, Vault & Keychain Layer (`backend/src/security.rs`):** DNS-pinned outbound SSRF validator (`validate_outbound_url` with trailing-dot FQDN canonicalization, IPv6 transition & IPv4 reserved range blocking, `.no_proxy()`, and per-hop redirect validation), `LocalFieldVault` (AES-256-GCM with AAD), invisible Unicode/bidi/Tag stripper, full HTML-tag & reference-link Markdown sanitizer, CSPRNG token & constant-time compare helpers, and strictly opt-in OS native Keychain integration.
+  - **Embedded SQLite + FTS5 & Migration (`backend/src/storage.rs`):** Persists CVEs, triage states, 14-day EPSS history, sweep delta snapshots, local OTX pulses, 24h CTI enrichment cache, AES-256-GCM encrypted webhook URLs & TOTP seeds, and local auth tables (`auth_users`, `auth_sessions`) in `data/threat_board.db` (`0600` Unix / owner-only Windows ACL) and auto-migrates legacy `data/threat_store.json`.
   - **Local SBOM Correlator (`backend/src/stack.rs`):** Auto-detects and parses 10 SBOM & lockfile formats offline and correlates them across live feeds.
-  - **Webhooks & Exports (`backend/src/webhooks.rs`, `export.rs`):** HMAC-SHA256 signed Slack/Discord/Teams/Generic webhooks (masked URLs), STIX 2.1 bundles, EDL/`nftables`/`pf` blocklists, formula-safe CSVs, Markdown dossiers, and SHA-256 verified offline snapshots.
+  - **Webhooks & Exports (`backend/src/webhooks.rs`, `export.rs`):** Replay-protected HMAC-SHA256 signed Slack/Discord/Teams/Generic webhooks (`X-AiBrainWorX-Timestamp` + `X-AiBrainWorX-Delivery-Id`, secret rotation, masked URLs), STIX 2.1 bundles, public-IP-filtered EDL/`nftables`/`pf` blocklists, formula-safe CSVs, Markdown dossiers, and SHA-256 verified offline snapshots.
 - **React 19 + Meta Astryx Frontend (`frontend/`):** Built with `React 19.1`, `TypeScript 5.8`, `Vite 6`, `@astryxdesign/core` (`0.7.16`), `Recharts 3`, and `lucide-react`, including a zero-dependency A2UI 1.0 catalog renderer (`components/A2uiRenderer.tsx`), optional BYO CTI Enrichment Hub (`components/CtiEnrichmentHub.tsx`), client-side OPSEC redaction & Markdown sanitization (`utils/opsec.ts`), and an optional `VITE_DEMO_MODE=1` static synthetic demo build (`demoData.ts`).
+
+---
+
+## Changelog & Security Policy
+
+- **Version Changelog:** See [CHANGELOG.md](CHANGELOG.md) for full release notes from `v0.1.0` through `v0.6.1` (Security Hardening).
+- **Security Architecture & Disclosure:** See [SECURITY.md](SECURITY.md) for our threat model, SSRF/Auth/Vault controls, and vulnerability disclosure policy.
 
 ---
 

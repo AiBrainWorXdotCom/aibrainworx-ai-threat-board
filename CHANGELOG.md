@@ -2,6 +2,28 @@
 
 All notable changes to **AiBrainWorX AI CyberSecurity Threat Analysis Board** are documented here.
 
+## v0.6.1 (2026-11-24)
+
+### Comprehensive Security Hardening Release (48 Rust Security & Regression Tests)
+- **SSRF & Outbound HTTP Hardening (`backend/src/security.rs`, `feeds.rs`, `ai_providers.rs`):**
+  - Fixed trailing-dot FQDN DNS-rebinding TOCTOU mismatch (`https://host./...`) by canonicalizing domain hostnames directly inside `ValidatedUrl.url` before socket pinning so `reqwest` lookup keys always match `resolve_to_addrs`.
+  - Expanded IPv4/IPv6 SSRF blocking to reject NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`), Teredo (`2001:0000::/32`), deprecated IPv4-compatible (`::x.x.x.x`), IPv4-translated (`::ffff:0:x.x.x.x`), site-local (`fec0::/10`), discard (`100::/64`), benchmark (`2001:2::/48`), ORCHID (`2001:10::/28`, `2001:20::/28`), IPv4 Class E (`240.0.0.0/4`), and `192.0.0.0/24`.
+  - Replaced blind multi-redirect HTTP fetches on built-in threat feeds with per-hop SSRF-validated, DNS-pinned `send_ssrf_safe_get` / `send_ssrf_safe_post_json` helpers (`Policy::none()` + `.no_proxy()`) so compromised mirrors cannot redirect to loopback, RFC1918, or cloud metadata endpoints, and disabled implicit `HTTP_PROXY`/`HTTPS_PROXY` bypasses on all pinned clients.
+- **Auth, Non-Loopback Exposure & Rate-Limiting Hardening (`backend/src/main.rs`, `routes.rs`):**
+  - Closed unauthenticated first-boot `/api/auth/setup` takeover race on non-loopback / token-protected instances: when `AUTH_TOKEN` is configured (or auto-generated on non-loopback boot), `POST /api/auth/setup` now strictly requires matching `AUTH_TOKEN` via `Authorization: Bearer`, session cookie, or `setup_token`.
+  - Stopped logging raw auto-generated bootstrap `AUTH_TOKEN` credentials to stdout; writes the full token with restrictive `0600`/owner-only permissions to `<data_dir>/.bootstrap_auth_token` and logs only a masked preview + file path.
+  - Eliminated login brute-force rate-limiter bypass via spoofed `X-Forwarded-For` / `User-Agent` rotation by keying rate limits strictly from TCP peer `ConnectInfo<SocketAddr>` (ignoring proxy headers and `X-Forwarded-Proto` unless explicitly opted in via `--trust-proxy` / `TRUST_PROXY_HEADERS=1`).
+  - Added `--allowed-hosts` / `ALLOWED_HOSTS` explicit Host allowlist for wildcard `--bind 0.0.0.0` / `::` DNS-rebinding protection, tightened exact `Origin` host+port matching, and extended `Cache-Control: no-store` to `/api/cti/*`, `/api/iocs/pcap`, `/api/my-stack`, and `/api/ai/*`.
+- **At-Rest Secret Vault & Webhook Replay Protection (`backend/src/security.rs`, `storage.rs`, `webhooks.rs`, `routes.rs`):**
+  - Added authenticated **AES-256-GCM (`LocalFieldVault`)** encryption with field-bound AAD for local SQLite 2FA TOTP seeds (`totp_secret_b32`) and Slack/Discord/Teams webhook bearer URLs, backed by `ABW_VAULT_KEY` or OS Native Keychain (`keyring` v3, with `0600` keyfile fallback in headless containers) and seamless backward-compatible upgrade of pre-v0.6.1 DBs. Added best-effort owner-only NTFS ACL hardening on Windows alongside POSIX `0600` on SQLite DB/WAL/SHM files.
+  - Made OS Keychain persistence for webhook HMAC signing secrets strictly opt-in (`save_secret_to_keychain`, RAM-only by default — consistent with AI and CTI keys).
+  - Upgraded outbound webhooks with timestamped replay protection (`X-AiBrainWorX-Timestamp`, `X-AiBrainWorX-Delivery-Id`, and `X-AiBrainWorX-Signature-256: t=<ts>,id=<uuid>,v1=<hmac_sha256(secret, "{ts}.{id}.{body}")>`), verification helper (`verify_webhook_delivery_hmac_sha256`), fail-closed signing, and zero-downtime secret/URL rotation via `PUT /api/webhooks/{id}`.
+- **A2UI, Markdown Sanitizer, Prompt Framing & Parser Hardening (`a2ui.rs`, `A2uiRenderer.tsx`, `opsec.ts`, `analyzer.rs`, `pcap.rs`, `stack.rs`, `export.rs`):**
+  - Upgraded both Rust and React Markdown sanitizers to strip all raw HTML tags (not just a narrow denylist), block reference-style images (`![alt][ref]`), sanitize reference link definitions (`[1]: javascript:...`), and reject angle-bracketed / HTML-entity-encoded / protocol-relative dangerous URIs.
+  - Aligned Rust A2UI component render-tree depth validation (`MAX_COMPONENT_TREE_DEPTH = 6`) with React, allowlisted KPI `tone` CSS classes, blocked `__proto__`/`constructor`/`prototype` keys in RFC 6901 `resolvePointer`, and extended OPSEC display redaction across KPI/chart labels.
+  - Made `<untrusted_telemetry_data>` breakout neutralization case-insensitive (`(?i)`) in `analyzer.rs`.
+  - Bounded PCAPNG Interface Description Blocks (`MAX_PCAPNG_INTERFACES = 1_024`) and total blocks (`MAX_PCAPNG_BLOCKS = 300_000`) with overflow-safe `checked_add`, offloaded PCAP parsing to `tokio::task::spawn_blocking` outside `ThreatStore` locks, added `MAX_COMPONENTS` & recursion caps + `OnceLock` regex caching across SBOM/lockfile parsers, filtered private/loopback/metadata IPs out of EDL/`pf`/`nftables` firewall exports, and fixed STIX 2.1 `ipv4-addr`/`ipv6-addr` pattern typing.
+
 ## v0.6.0 (2026-11-23)
 
 ### Optional BYO CTI Enrichment Hub, Private OTX Pulse Sync & 24h SQLite Cache

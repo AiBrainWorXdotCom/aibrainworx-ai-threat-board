@@ -14,6 +14,7 @@ mod storage;
 mod store;
 mod webhooks;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use crate::auth::AuthRateLimiter;
 use crate::feeds::run_sweep;
 use crate::models::SseEvent;
 use crate::routes::{api_router, is_auth_enforced, is_request_authenticated};
-use crate::security::generate_random_token;
+use crate::security::{generate_random_token, restrict_private_file_permissions};
 use crate::stack::correlate_stack;
 use crate::storage::SqliteStorage;
 use crate::store::{AppState, ServerModeConfig, ThreatStore};
@@ -49,6 +50,7 @@ struct EmbeddedAssets;
 #[derive(Clone)]
 struct SecurityConfig {
     allowed_origins: Vec<String>,
+    allowed_hosts: Vec<String>,
     dev_mode: bool,
     bind_is_loopback: bool,
     bind_ip: String,
@@ -61,9 +63,23 @@ struct CliOptions {
     offline: bool,
     no_auth: bool,
     reset_auth: bool,
+    trust_proxy_headers: bool,
     bind: String,
     port: u16,
+    allowed_hosts: Vec<String>,
     data_dir: Option<PathBuf>,
+}
+
+fn parse_allowed_hosts_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| {
+            s.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn parse_cli_and_env() -> CliOptions {
@@ -71,6 +87,7 @@ fn parse_cli_and_env() -> CliOptions {
     let mut offline = std::env::var("OFFLINE_MODE").as_deref() == Ok("1");
     let mut no_auth = std::env::var("NO_AUTH").as_deref() == Ok("1");
     let mut reset_auth = false;
+    let mut trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS").as_deref() == Ok("1");
     let mut bind = std::env::var("BIND_ADDR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -79,6 +96,10 @@ fn parse_cli_and_env() -> CliOptions {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
+    let mut allowed_hosts = std::env::var("ALLOWED_HOSTS")
+        .ok()
+        .map(|s| parse_allowed_hosts_csv(&s))
+        .unwrap_or_default();
     let mut data_dir = std::env::var("DATA_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -92,6 +113,7 @@ fn parse_cli_and_env() -> CliOptions {
             "--offline" => offline = true,
             "--no-auth" => no_auth = true,
             "--reset-auth" => reset_auth = true,
+            "--trust-proxy" => trust_proxy_headers = true,
             "--bind" => {
                 if let Some(val) = args.get(i + 1) {
                     bind = val.trim().to_string();
@@ -106,6 +128,12 @@ fn parse_cli_and_env() -> CliOptions {
                     i += 1;
                 }
             }
+            "--allowed-hosts" => {
+                if let Some(val) = args.get(i + 1) {
+                    allowed_hosts.extend(parse_allowed_hosts_csv(val));
+                    i += 1;
+                }
+            }
             "--data-dir" => {
                 if let Some(val) = args.get(i + 1) {
                     data_dir = Some(PathBuf::from(val.trim()));
@@ -114,7 +142,7 @@ fn parse_cli_and_env() -> CliOptions {
             }
             "-h" | "--help" => {
                 println!(
-                    "AiBrainWorX Threat Board v{}\nUsage: aibrainworx-threat-board [OPTIONS]\n  --wallboard         Read-only kiosk display mode\n  --offline           Air-gapped mode (disable outbound threat feed sweeps)\n  --no-auth           Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)\n  --reset-auth        Clear local admin password & 2FA to return to first-run setup\n  --bind <IP>         Bind IP address (default: 127.0.0.1; non-loopback enforces auth)\n  --port <PORT>       Listen port (default: 8080)\n  --data-dir <DIR>    Override SQLite data directory (default: ./data)",
+                    "AiBrainWorX Threat Board v{}\nUsage: aibrainworx-threat-board [OPTIONS]\n  --wallboard              Read-only kiosk display mode\n  --offline                Air-gapped mode (disable outbound threat feed sweeps)\n  --no-auth                Disable login screen on loopback 127.0.0.1 only (ignored on non-loopback)\n  --reset-auth             Clear local admin password & 2FA to return to first-run setup\n  --trust-proxy            Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy (off by default)\n  --allowed-hosts <CSV>    Explicit Host allowlist for non-loopback / 0.0.0.0 binds (or ALLOWED_HOSTS env)\n  --bind <IP>              Bind IP address (default: 127.0.0.1; non-loopback enforces auth)\n  --port <PORT>            Listen port (default: 8080)\n  --data-dir <DIR>         Override SQLite data directory (default: ./data)",
                     env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
@@ -129,8 +157,10 @@ fn parse_cli_and_env() -> CliOptions {
         offline,
         no_auth,
         reset_auth,
+        trust_proxy_headers,
         bind,
         port,
+        allowed_hosts,
         data_dir,
     }
 }
@@ -160,24 +190,46 @@ fn extract_host_without_port(raw_host: &str) -> Option<&str> {
     }
 }
 
-fn is_allowed_host(headers: &HeaderMap, bind_is_loopback: bool, bind_ip: &str) -> bool {
+fn is_valid_host_chars(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+}
+
+fn is_allowed_host(
+    headers: &HeaderMap,
+    bind_is_loopback: bool,
+    bind_ip: &str,
+    allowed_hosts: &[String],
+) -> bool {
     let Some(raw) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
     let Some(host) = extract_host_without_port(raw) else {
         return false;
     };
-    let lower = host.to_ascii_lowercase();
-    let is_loopback = matches!(lower.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1");
+    let lower = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if !is_valid_host_chars(&lower) {
+        return false;
+    }
+    let is_loopback = matches!(lower.as_str(), "127.0.0.1" | "localhost" | "::1");
     if bind_is_loopback {
         return is_loopback;
     }
     if is_loopback {
         return true;
     }
+    if !allowed_hosts.is_empty() {
+        return allowed_hosts.iter().any(|h| h == &lower);
+    }
     let clean_bind = bind_ip.trim().trim_start_matches('[').trim_end_matches(']');
     if clean_bind == "0.0.0.0" || clean_bind == "::" {
-        return !lower.is_empty();
+        return true;
     }
     lower == clean_bind.to_ascii_lowercase()
 }
@@ -238,7 +290,12 @@ async fn security_middleware(
     let path = req.uri().path().to_string();
     let is_api = path.starts_with("/api");
 
-    if !is_allowed_host(req.headers(), sec.bind_is_loopback, &sec.bind_ip) {
+    if !is_allowed_host(
+        req.headers(),
+        sec.bind_is_loopback,
+        &sec.bind_ip,
+        &sec.allowed_hosts,
+    ) {
         let mut resp = json_error_response(
             StatusCode::FORBIDDEN,
             "Forbidden: Host header rejected by local DNS-rebinding policy",
@@ -266,15 +323,29 @@ async fn security_middleware(
                         .headers()
                         .get(header::HOST)
                         .and_then(|h| h.to_str().ok())
-                        .unwrap_or("");
+                        .unwrap_or("")
+                        .trim();
                     url::Url::parse(origin).ok().is_some_and(|u| {
-                        let o_host = u.host_str().unwrap_or("");
-                        let o_with_port = match u.port() {
-                            Some(p) => format!("{o_host}:{p}"),
-                            None => o_host.to_string(),
+                        if u.scheme() != "http" && u.scheme() != "https" {
+                            return false;
+                        }
+                        let Some(o_host) = u.host_str() else {
+                            return false;
                         };
-                        o_with_port.eq_ignore_ascii_case(host_hdr)
-                            || o_host.eq_ignore_ascii_case(host_hdr)
+                        let o_port = u.port_or_known_default();
+                        let (h_host, h_port) = match extract_host_without_port(host_hdr) {
+                            Some(hh) => {
+                                let port_part = host_hdr
+                                    .strip_prefix(hh)
+                                    .and_then(|rest| rest.strip_prefix(':'))
+                                    .and_then(|p| p.parse::<u16>().ok());
+                                (hh, port_part)
+                            }
+                            None => return false,
+                        };
+                        let default_port = if u.scheme() == "https" { 443 } else { 80 };
+                        o_host.eq_ignore_ascii_case(h_host)
+                            && o_port == Some(h_port.unwrap_or(default_port))
                     })
                 } else {
                     false
@@ -324,8 +395,11 @@ async fn security_middleware(
 
     let mut resp = next.run(req).await;
     let is_sensitive_no_store = path.starts_with("/api/auth/")
-        || path == "/api/ai/config"
-        || path == "/api/webhooks"
+        || path.starts_with("/api/ai/")
+        || path.starts_with("/api/webhooks")
+        || path.starts_with("/api/cti/")
+        || path.starts_with("/api/iocs/pcap")
+        || path.starts_with("/api/my-stack")
         || path == "/api/snapshot/export";
     apply_security_headers(&mut resp, is_sensitive_no_store);
     resp
@@ -411,6 +485,7 @@ fn build_asset_response(path: &str, bytes: Vec<u8>) -> Response {
 fn build_app(
     state: AppState,
     allowed_origins: Vec<String>,
+    allowed_hosts: Vec<String>,
     dev_mode: bool,
     bind_ip: String,
     static_dir_override: Option<PathBuf>,
@@ -434,6 +509,7 @@ fn build_app(
 
     let sec_cfg = SecurityConfig {
         allowed_origins,
+        allowed_hosts,
         dev_mode,
         bind_is_loopback,
         bind_ip,
@@ -518,23 +594,62 @@ async fn main() {
         explicit_token
     } else if !bind_is_loopback && !db.has_any_auth_user() {
         let generated = generate_random_token(24).expect("Failed generating CSPRNG access token");
+        let token_file = data_dir.join(".bootstrap_auth_token");
+        let _ = std::fs::create_dir_all(&data_dir);
+        let file_written = std::fs::write(&token_file, format!("{generated}\n")).is_ok();
+        if file_written {
+            restrict_private_file_permissions(&token_file);
+        }
+        let preview = if generated.len() >= 8 {
+            format!(
+                "{}••••••••{}",
+                &generated[..4],
+                &generated[generated.len() - 4..]
+            )
+        } else {
+            "••••••••".to_string()
+        };
         info!("================================================================");
         info!(
             "NON-LOOPBACK BIND DETECTED ({}) WITHOUT LOCAL ADMIN OR AUTH_TOKEN",
             cli.bind
         );
-        info!("Generated fallback session access token (use Bearer header or UI prompt):");
-        info!("AUTH_TOKEN={}", generated);
+        if file_written {
+            info!(
+                "Generated bootstrap AUTH_TOKEN ({}) and wrote it with 0600 permissions to:",
+                preview
+            );
+            info!("  {}", token_file.display());
+            info!(
+                "Use it as Bearer token or `setup_token` on /api/auth/setup, then delete the file."
+            );
+        } else {
+            info!(
+                "Generated bootstrap AUTH_TOKEN ({}) in RAM; set AUTH_TOKEN env var explicitly for automation.",
+                preview
+            );
+        }
         info!("================================================================");
         Some(generated)
     } else {
         None
     };
 
+    if !bind_is_loopback
+        && (cli.bind == "0.0.0.0" || cli.bind == "::")
+        && cli.allowed_hosts.is_empty()
+    {
+        tracing::warn!(
+            "Wildcard bind ({}) started without ALLOWED_HOSTS / --allowed-hosts. Set ALLOWED_HOSTS=<hostname-or-ip> to strictly enforce Host-header DNS-rebinding defense.",
+            cli.bind
+        );
+    }
+
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .gzip(true)
         .deflate(true)
         .build()
@@ -544,6 +659,7 @@ async fn main() {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .gzip(true)
         .deflate(true)
         .build()
@@ -566,6 +682,7 @@ async fn main() {
             no_auth_mode,
             auth_token: auth_token.clone(),
             bind_addr: cli.bind.clone(),
+            trust_proxy_headers: cli.trust_proxy_headers,
         },
         started_at: Instant::now(),
     };
@@ -608,6 +725,10 @@ async fn main() {
     if !bind_is_loopback && cli.bind != "0.0.0.0" && cli.bind != "::" {
         allowed_origins.push(format!("http://{}:{}", cli.bind, cli.port));
     }
+    for host in &cli.allowed_hosts {
+        allowed_origins.push(format!("http://{}:{}", host, cli.port));
+        allowed_origins.push(format!("https://{}", host));
+    }
     if dev_mode {
         allowed_origins.push("http://127.0.0.1:5173".to_string());
         allowed_origins.push("http://localhost:5173".to_string());
@@ -628,6 +749,7 @@ async fn main() {
     let app = build_app(
         state,
         allowed_origins,
+        cli.allowed_hosts.clone(),
         dev_mode,
         cli.bind.clone(),
         static_override.clone(),
@@ -652,17 +774,21 @@ async fn main() {
     info!("SQLite Store  : {}", db_path.display());
     info!("Frontend      : {}", frontend_label);
     info!(
-        "Modes         : wallboard={} | offline={} | auth={} | no_auth={}",
+        "Modes         : wallboard={} | offline={} | auth={} | no_auth={} | trust_proxy={}",
         cli.wallboard,
         cli.offline,
         !no_auth_mode || auth_token.is_some(),
-        no_auth_mode
+        no_auth_mode,
+        cli.trust_proxy_headers
     );
     info!("================================================================");
 
-    axum::serve(listener, app)
-        .await
-        .expect("Axum server exited unexpectedly");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("Axum server exited unexpectedly");
 }
 
 fn resolve_paths() -> (PathBuf, Option<PathBuf>) {
@@ -721,6 +847,7 @@ mod tests {
                 no_auth_mode,
                 auth_token,
                 bind_addr: "127.0.0.1".to_string(),
+                trust_proxy_headers: false,
             },
             started_at: Instant::now(),
         };
@@ -733,6 +860,7 @@ mod tests {
         let app = build_app(
             state,
             vec!["http://127.0.0.1:8080".into()],
+            vec![],
             false,
             "127.0.0.1".into(),
             None,
@@ -764,6 +892,7 @@ mod tests {
         let app = build_app(
             state,
             vec!["http://127.0.0.1:8080".into()],
+            vec![],
             false,
             "127.0.0.1".into(),
             None,
@@ -846,6 +975,7 @@ mod tests {
         let app = build_app(
             state,
             vec!["http://127.0.0.1:8080".into()],
+            vec![],
             false,
             "127.0.0.1".into(),
             None,
@@ -1031,6 +1161,101 @@ mod tests {
                 assert!(resp.headers().contains_key(header::RETRY_AFTER));
             }
         }
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn blocks_unauthenticated_setup_takeover_and_header_spoofed_rate_limit_bypass() {
+        let (state, db_path) =
+            test_state_with_auth(false, false, Some("bootstrap-secret-42".into()));
+        let app = build_app(
+            state,
+            vec!["http://soc.internal:8080".into()],
+            vec!["soc.internal".into()],
+            false,
+            "0.0.0.0".into(),
+            None,
+        );
+
+        // 1. Wildcard 0.0.0.0 bind with ALLOWED_HOSTS rejects rogue Host headers
+        let bad_host = axum::http::Request::builder()
+            .uri("/api/health")
+            .header(header::HOST, "evil.rebind.attacker:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(bad_host).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 2. Unauthenticated /api/auth/setup on token-protected instance is rejected with 401
+        let unauth_setup = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/setup")
+            .header(header::HOST, "soc.internal:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"attacker","password":"AttackerPassword!99"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauth_setup).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 3. /api/auth/setup succeeds ONLY when matching bootstrap setup_token is supplied
+        let valid_setup = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/setup")
+            .header(header::HOST, "soc.internal:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"realadmin","password":"RealAdminPassword!99","setup_token":"bootstrap-secret-42"}"#,
+            ))
+            .unwrap();
+        let setup_resp = app.clone().oneshot(valid_setup).await.unwrap();
+        assert_eq!(setup_resp.status(), StatusCode::OK);
+
+        // 4. Rotating X-Forwarded-For and User-Agent CANNOT bypass 5-attempt login lockout
+        for attempt in 1..=5 {
+            let bad = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/login")
+                .header(header::HOST, "soc.internal:8080")
+                .header("x-forwarded-for", format!("203.0.113.{attempt}"))
+                .header(header::USER_AGENT, format!("SpoofedBot/{attempt}.0"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"realadmin","password":"WrongPassword!00"}"#,
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(bad).await.unwrap();
+            if attempt < 5 {
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+
+        // 5. Sensitive CTI & My Stack endpoints enforce Cache-Control: no-store
+        let cti_req = axum::http::Request::builder()
+            .uri("/api/cti/config")
+            .header(header::HOST, "soc.internal:8080")
+            .header(header::AUTHORIZATION, "Bearer bootstrap-secret-42")
+            .body(Body::empty())
+            .unwrap();
+        let cti_resp = app.clone().oneshot(cti_req).await.unwrap();
+        assert_eq!(cti_resp.status(), StatusCode::OK);
+        assert_eq!(
+            cti_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));

@@ -1,15 +1,16 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use chrono::Utc;
 use futures::stream::Stream;
 use serde::Deserialize;
@@ -223,13 +224,15 @@ pub fn is_request_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 
 fn build_session_cookie_header(
     req_headers: &HeaderMap,
+    trust_proxy_headers: bool,
     raw_token: &str,
     max_age_secs: i64,
 ) -> String {
-    let is_https = req_headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    let is_https = trust_proxy_headers
+        && req_headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
     let secure_attr = if is_https { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE_NAME}={raw_token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age_secs}{secure_attr}"
@@ -251,18 +254,30 @@ fn extract_sanitized_user_agent(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "Unknown Browser".to_string())
 }
 
-fn extract_rate_limit_client(headers: &HeaderMap) -> String {
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("ua");
-    let fwd = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .unwrap_or("local");
-    let digest = hash_secret_sha256(&format!("{fwd}|{ua}"));
+/// Computes the rate-limit client identifier strictly from the TCP peer IP (`ConnectInfo`).
+/// Untrusted `X-Forwarded-For` and `User-Agent` headers are ignored unless the operator
+/// explicitly opted into `TRUST_PROXY_HEADERS=1` / `--trust-proxy`.
+fn extract_rate_limit_client(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_proxy_headers: bool,
+) -> String {
+    let client_ip = if trust_proxy_headers {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| peer_addr.map(|a| a.ip().to_string()))
+            .unwrap_or_else(|| "local".to_string())
+    } else {
+        peer_addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "local".to_string())
+    };
+    let digest = hash_secret_sha256(&client_ip);
     digest[..16].to_string()
 }
 
@@ -323,6 +338,30 @@ async fn auth_setup(
             })),
         )
             .into_response();
+    }
+
+    // Prevent unauthenticated first-boot admin takeover on non-loopback binds or when AUTH_TOKEN
+    // is configured: require matching bootstrap AUTH_TOKEN via Bearer, session cookie, or setup_token.
+    if let Some(expected_token) = state.server_mode.auth_token.as_deref() {
+        let bearer_ok =
+            extract_bearer_token(&req_headers).is_some_and(|t| constant_time_eq(t, expected_token));
+        let cookie_ok = extract_session_cookie(&req_headers, SESSION_COOKIE_NAME)
+            .is_some_and(|t| constant_time_eq(t, expected_token));
+        let body_ok = body
+            .setup_token
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|t| !t.is_empty() && constant_time_eq(t, expected_token));
+        if !(bearer_ok || cookie_ok || body_ok) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Bootstrap AUTH_TOKEN is required to create the initial administrator account.",
+                    "auth_required": true
+                })),
+            )
+                .into_response();
+        }
     }
 
     let username = match validate_username(&body.username) {
@@ -403,7 +442,12 @@ async fn auth_setup(
             .into_response();
     }
 
-    let cookie_val = build_session_cookie_header(&req_headers, &raw_token, ttl);
+    let cookie_val = build_session_cookie_header(
+        &req_headers,
+        state.server_mode.trust_proxy_headers,
+        &raw_token,
+        ttl,
+    );
     let mut resp = (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -423,10 +467,15 @@ async fn auth_setup(
 
 async fn auth_login(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     req_headers: HeaderMap,
     Json(body): Json<AuthLoginRequest>,
 ) -> impl IntoResponse {
-    let client_id = extract_rate_limit_client(&req_headers);
+    let client_id = extract_rate_limit_client(
+        peer.map(|Extension(ConnectInfo(addr))| addr),
+        &req_headers,
+        state.server_mode.trust_proxy_headers,
+    );
 
     // Path A: Legacy/automation AUTH_TOKEN login (only when token field is supplied and AUTH_TOKEN is configured)
     let raw_static_token = body.token.trim();
@@ -473,7 +522,12 @@ async fn auth_login(
         }
 
         state.auth_limiter.record_success(&rate_key);
-        let cookie_val = build_session_cookie_header(&req_headers, expected, 43_200);
+        let cookie_val = build_session_cookie_header(
+            &req_headers,
+            state.server_mode.trust_proxy_headers,
+            expected,
+            43_200,
+        );
         let mut resp = (
             StatusCode::OK,
             Json(serde_json::json!({ "authenticated": true, "auth_required": true })),
@@ -630,7 +684,12 @@ async fn auth_login(
             .into_response();
     }
 
-    let cookie_val = build_session_cookie_header(&req_headers, &raw_token, ttl);
+    let cookie_val = build_session_cookie_header(
+        &req_headers,
+        state.server_mode.trust_proxy_headers,
+        &raw_token,
+        ttl,
+    );
     let mut resp = (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2024,12 +2083,25 @@ async fn analyze_pcap_upload(
         .as_deref()
         .unwrap_or("capture.pcap")
         .to_string();
-    let store = state.store.read().await;
-    match crate::pcap::analyze_pcap_bytes(&filename, &body, &store) {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-        Err(msg) => (
+    // Snapshot lightweight IOC lookup maps and release the RwLock BEFORE CPU parsing on spawn_blocking
+    let idx = {
+        let store = state.store.read().await;
+        crate::pcap::PcapThreatIndex::from_store(&store)
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::pcap::analyze_pcap_bytes_with_index(&filename, &body, &idx)
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(msg)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("PCAP analysis worker error: {e}") })),
         )
             .into_response(),
     }
@@ -2039,14 +2111,31 @@ async fn analyze_pcap_sample(State(state): State<AppState>) -> impl IntoResponse
     if let Err(resp) = require_writable(&state) {
         return *resp;
     }
-    let store = state.store.read().await;
-    let sample_bytes = crate::pcap::build_synthetic_sample_pcap(&store);
-    match crate::pcap::analyze_pcap_bytes("aibrainworx-sample-incident.pcap", &sample_bytes, &store)
-    {
-        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-        Err(msg) => (
+    let (sample_bytes, idx) = {
+        let store = state.store.read().await;
+        (
+            crate::pcap::build_synthetic_sample_pcap(&store),
+            crate::pcap::PcapThreatIndex::from_store(&store),
+        )
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::pcap::analyze_pcap_bytes_with_index(
+            "aibrainworx-sample-incident.pcap",
+            &sample_bytes,
+            &idx,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("PCAP sample worker error: {e}") })),
         )
             .into_response(),
     }
@@ -2510,7 +2599,8 @@ async fn create_webhook(
         .map(str::to_string)
         .unwrap_or_default();
     let has_secret = !secret.is_empty();
-    if has_secret {
+    let save_to_keychain = req.save_secret_to_keychain.unwrap_or(false);
+    if has_secret && save_to_keychain {
         let _ = keychain_set(&format!("webhook_secret_{id}"), &secret);
     }
 
@@ -2525,6 +2615,7 @@ async fn create_webhook(
         stack_only: req.stack_only.unwrap_or(false),
         signing_secret: secret,
         has_signing_secret: has_secret,
+        save_secret_to_keychain: save_to_keychain,
         last_status: None,
         last_sent_at: None,
         failure_count: 0,
@@ -2554,6 +2645,29 @@ async fn update_webhook(
         return *resp;
     }
 
+    // Validate optional rotated URL outside the store lock
+    let validated_new_url = if let Some(raw_url) = req.url.as_deref().map(str::trim) {
+        if raw_url.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Webhook URL cannot be empty" })),
+            )
+                .into_response();
+        }
+        match validate_outbound_url(raw_url, OutboundUrlPolicy::StrictPublicHttps).await {
+            Ok(v) => Some(v.url.to_string()),
+            Err(reason) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     let mut store = state.store.write().await;
     let Some(hook) = store.webhooks.iter_mut().find(|w| w.id == id) else {
         return (
@@ -2562,6 +2676,9 @@ async fn update_webhook(
         )
             .into_response();
     };
+    if let Some(new_url) = validated_new_url {
+        hook.url = new_url;
+    }
     if let Some(enabled) = req.enabled {
         hook.enabled = enabled;
     }
@@ -2573,6 +2690,33 @@ async fn update_webhook(
     }
     if let Some(stack_only) = req.stack_only {
         hook.stack_only = stack_only;
+    }
+    if let Some(save_kc) = req.save_secret_to_keychain {
+        hook.save_secret_to_keychain = save_kc;
+        if !save_kc {
+            let _ = keychain_delete(&format!("webhook_secret_{id}"));
+        } else if !hook.signing_secret.is_empty() {
+            let _ = keychain_set(&format!("webhook_secret_{id}"), &hook.signing_secret);
+        }
+    }
+    if req.clear_signing_secret == Some(true) {
+        hook.signing_secret.clear();
+        hook.has_signing_secret = false;
+        let _ = keychain_delete(&format!("webhook_secret_{id}"));
+    } else if let Some(new_secret) = req.signing_secret.as_deref().map(str::trim) {
+        if new_secret.is_empty() {
+            hook.signing_secret.clear();
+            hook.has_signing_secret = false;
+            let _ = keychain_delete(&format!("webhook_secret_{id}"));
+        } else {
+            hook.signing_secret = new_secret.to_string();
+            hook.has_signing_secret = true;
+            if hook.save_secret_to_keychain {
+                let _ = keychain_set(&format!("webhook_secret_{id}"), new_secret);
+            } else {
+                let _ = keychain_delete(&format!("webhook_secret_{id}"));
+            }
+        }
     }
     let public_view = to_public_webhook(hook);
     let _ = state.persist_store(&store);

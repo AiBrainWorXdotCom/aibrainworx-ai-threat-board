@@ -1,7 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use axum::http::{header, HeaderMap};
 use regex::{Captures, Regex};
 use tokio::net::lookup_host;
@@ -9,6 +12,7 @@ use url::{Host, Url};
 
 pub const KEYCHAIN_SERVICE: &str = "aibrainworx-threat-board";
 pub const KEYCHAIN_ACCOUNT_AI_API_KEY: &str = "ai_provider_api_key";
+pub const KEYCHAIN_ACCOUNT_DB_VAULT_KEY: &str = "db_vault_key_v1";
 pub const SESSION_COOKIE_NAME: &str = "abw_session";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,12 +56,16 @@ fn is_ipv4_allowed(v4: Ipv4Addr, policy: OutboundUrlPolicy) -> bool {
     let is_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
     let is_benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
     let is_this_network = octets[0] == 0;
+    let is_ietf_protocol = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+    let is_class_e = octets[0] >= 240;
     let is_reserved_or_non_public = v4.is_unspecified()
         || v4.is_multicast()
         || v4.is_broadcast()
         || v4.is_link_local()
         || v4.is_documentation()
-        || is_this_network;
+        || is_this_network
+        || is_ietf_protocol
+        || is_class_e;
 
     if is_reserved_or_non_public {
         return false;
@@ -87,10 +95,49 @@ fn is_ipv4_allowed(v4: Ipv4Addr, policy: OutboundUrlPolicy) -> bool {
 fn is_ipv6_allowed(v6: Ipv6Addr, policy: OutboundUrlPolicy) -> bool {
     let seg = v6.segments();
     let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+    let is_site_local = (seg[0] & 0xffc0) == 0xfec0;
     let is_ula = (seg[0] & 0xfe00) == 0xfc00;
     let is_doc = seg[0] == 0x2001 && seg[1] == 0x0db8;
+    // IPv6 transition & special-use ranges that can encapsulate/translate private IPv4 targets
+    let is_nat64_well_known = seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0;
+    let is_nat64_local = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001;
+    let is_6to4 = seg[0] == 0x2002;
+    let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
+    let is_ipv4_compatible = seg[0] == 0
+        && seg[1] == 0
+        && seg[2] == 0
+        && seg[3] == 0
+        && seg[4] == 0
+        && seg[5] == 0
+        && !v6.is_unspecified()
+        && !v6.is_loopback();
+    let is_ipv4_translated =
+        seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0xffff && seg[5] == 0;
+    let is_discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
+    let is_benchmark = seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0;
+    let is_orchid =
+        seg[0] == 0x2001 && ((seg[1] & 0xfff0) == 0x0010 || (seg[1] & 0xffe0) == 0x0020);
 
-    if v6.is_unspecified() || v6.is_multicast() || is_link_local || is_doc {
+    if v6.is_unspecified()
+        || v6.is_multicast()
+        || is_link_local
+        || is_site_local
+        || is_doc
+        || is_nat64_well_known
+        || is_nat64_local
+        || is_6to4
+        || is_teredo
+        || is_ipv4_compatible
+        || is_ipv4_translated
+        || is_discard
+        || is_benchmark
+        || is_orchid
+    {
         return false;
     }
 
@@ -150,17 +197,28 @@ pub async fn validate_outbound_url(
         return Err("URL exceeds maximum length (2048 chars)".into());
     }
 
-    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid URL: {e}"))?;
+    let mut parsed = Url::parse(trimmed).map_err(|e| format!("Invalid URL: {e}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("URL credentials (user:pass@host) are not permitted".into());
     }
 
-    let scheme = parsed.scheme();
-    let host_str = parsed
+    let scheme = parsed.scheme().to_string();
+    let raw_host = parsed
         .host_str()
         .ok_or_else(|| "URL must contain a valid hostname".to_string())?
-        .trim_end_matches('.')
         .to_string();
+    let host_str = raw_host.trim_end_matches('.').to_string();
+    if host_str.is_empty() || host_str.contains("..") {
+        return Err("URL contains an empty or malformed hostname".into());
+    }
+    // Canonicalize trailing-dot FQDNs (e.g. `https://example.com./hook` -> `https://example.com/hook`)
+    // directly inside `parsed` so reqwest's lookup key ALWAYS matches `resolve_to_addrs(&validated.host, ...)`,
+    // eliminating trailing-dot DNS-rebinding TOCTOU mismatches.
+    if matches!(parsed.host(), Some(Host::Domain(_))) && raw_host != host_str {
+        parsed
+            .set_host(Some(&host_str))
+            .map_err(|_| format!("Invalid canonical hostname: {host_str}"))?;
+    }
     let host_lower = host_str.to_ascii_lowercase();
 
     match policy {
@@ -278,16 +336,20 @@ fn is_loopback_or_lan_ip(ip: IpAddr, allow_lan: bool) -> bool {
     }
 }
 
-/// Builds a no-redirect reqwest Client pinned to the DNS-validated socket addresses
-/// so remote 302 redirects or DNS rebinding cannot bypass SSRF validation.
+/// Builds a no-redirect, no-proxy reqwest Client pinned to the DNS-validated socket addresses
+/// so remote 302 redirects, proxy env vars, or DNS rebinding cannot bypass SSRF validation.
 pub fn build_pinned_http_client(
     validated: &ValidatedUrl,
     timeout: Duration,
     user_agent: &str,
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .gzip(true)
+        .deflate(true)
         .user_agent(user_agent);
 
     if matches!(validated.url.host(), Some(Host::Domain(_))) && !validated.resolved_addrs.is_empty()
@@ -298,6 +360,74 @@ pub fn build_pinned_http_client(
     builder
         .build()
         .map_err(|e| format!("Failed to construct pinned HTTP client: {e}"))
+}
+
+/// Performs an outbound HTTPS GET request validating SSRF policy + DNS pinning on every
+/// redirect hop (up to `max_redirects`) so compromised feeds/mirrors cannot redirect to
+/// loopback, RFC1918, ULA, or cloud metadata addresses.
+pub async fn send_ssrf_safe_get(
+    url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    accept: Option<&str>,
+    max_redirects: usize,
+) -> Result<reqwest::Response, String> {
+    let mut current_url = url.to_string();
+
+    for hop in 0..=max_redirects {
+        let validated =
+            validate_outbound_url(&current_url, OutboundUrlPolicy::StrictPublicHttps).await?;
+        let client = build_pinned_http_client(&validated, timeout, user_agent)?;
+        let mut req = client.get(validated.url.clone());
+        if let Some(acc) = accept {
+            req = req.header("Accept", acc);
+        }
+
+        let resp = tokio::time::timeout(timeout, req.send())
+            .await
+            .map_err(|_| "Request timeout".to_string())?
+            .map_err(|e| e.without_url().to_string())?;
+
+        if resp.status().is_redirection() {
+            if hop >= max_redirects {
+                return Err(format!(
+                    "Redirect limit exceeded ({max_redirects} hops) while fetching feed"
+                ));
+            }
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Redirect response missing Location header".to_string())?;
+            let next_url = validated
+                .url
+                .join(loc)
+                .map_err(|e| format!("Invalid redirect Location URL: {e}"))?;
+            current_url = next_url.to_string();
+            continue;
+        }
+
+        return Ok(resp);
+    }
+
+    Err("Redirect limit exceeded".to_string())
+}
+
+/// Performs an outbound DNS-pinned, zero-redirect HTTPS POST with a JSON body.
+pub async fn send_ssrf_safe_post_json(
+    url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, String> {
+    let validated = validate_outbound_url(url, OutboundUrlPolicy::StrictPublicHttps).await?;
+    let client = build_pinned_http_client(&validated, timeout, user_agent)?;
+    tokio::time::timeout(timeout, client.post(validated.url).json(body).send())
+        .await
+        .map_err(|_| "Request timeout".to_string())?
+        .map_err(|e| e.without_url().to_string())
 }
 
 /// Strips invisible control characters, bidi overrides, zero-width spaces,
@@ -323,16 +453,40 @@ pub fn strip_invisible_unicode(input: &str) -> String {
     out
 }
 
+fn is_safe_markdown_link_target(raw_target: &str) -> bool {
+    let first_token = raw_target.split_whitespace().next().unwrap_or("");
+    let unwrapped = first_token
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(first_token)
+        .trim();
+    if unwrapped.is_empty() {
+        return false;
+    }
+    let lower = unwrapped.to_ascii_lowercase();
+    // Reject HTML entities or protocol-relative URLs that can disguise dangerous schemes
+    if lower.contains("&#") || lower.contains("&colon;") || lower.starts_with("//") {
+        return false;
+    }
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with('#')
+        || lower.starts_with('/')
+}
+
 /// Sanitizes LLM-returned Markdown before storage or rendering:
 /// - Strips invisible Unicode / bidi spoofing
-/// - Blocks Markdown tracking images (`![alt](url)` -> `[image omitted: alt]`)
-/// - Neutralizes dangerous link schemes (`javascript:`, `data:`, `file:`, `vbscript:`)
-/// - Strips raw HTML `<script>`, `<iframe>`, `<img>`, `<svg>`, `<style>`, `<object>`, `<embed>` tags
+/// - Blocks inline AND reference-style Markdown tracking images (`![alt](url)`, `![alt][ref]`)
+/// - Neutralizes dangerous link schemes (`javascript:`, `data:`, `file:`, `vbscript:`, entity-encoded)
+///   across inline links, angle-bracket links, and reference-style link definitions
+/// - Strips `<script>`/`<style>`/`<iframe>`/`<object>`/`<embed>`/`<svg>` blocks AND all raw HTML tags
 pub fn sanitize_llm_markdown(md: &str) -> String {
     static RE_SCRIPT_BLOCK: OnceLock<Regex> = OnceLock::new();
-    static RE_HTML_TAG: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_IMAGE: OnceLock<Regex> = OnceLock::new();
-    static RE_MD_LINK: OnceLock<Regex> = OnceLock::new();
+    static RE_ANY_HTML_TAG: OnceLock<Regex> = OnceLock::new();
+    static RE_MD_IMAGE_INLINE: OnceLock<Regex> = OnceLock::new();
+    static RE_MD_IMAGE_REF: OnceLock<Regex> = OnceLock::new();
+    static RE_MD_LINK_INLINE: OnceLock<Regex> = OnceLock::new();
+    static RE_MD_REF_DEF: OnceLock<Regex> = OnceLock::new();
 
     let clean_unicode = strip_invisible_unicode(md);
 
@@ -342,17 +496,18 @@ pub fn sanitize_llm_markdown(md: &str) -> String {
     });
     let no_scripts = re_script.replace_all(&clean_unicode, "");
 
-    let re_html_tag = RE_HTML_TAG.get_or_init(|| {
-        Regex::new(r"(?i)</?(script|style|iframe|object|embed|svg|img|link|meta|form|input|button|base|a)\b[^>]*>")
-            .expect("valid regex")
+    // Strip all raw HTML tags (e.g. <details open ontoggle=...>, <img ...>, <marquee>, etc.)
+    // while preserving prose comparisons like `a < 5` or `version <= 2.4`.
+    let re_html_tag = RE_ANY_HTML_TAG.get_or_init(|| {
+        Regex::new(r"(?i)</?[a-z][a-z0-9:-]*(?:\s+[^<>]*)?/?>").expect("valid regex")
     });
     let no_html_tags = re_html_tag.replace_all(&no_scripts, "");
 
-    // Remove remote Markdown image embeds to stop exfiltration/tracking pixels.
-    let re_img = RE_MD_IMAGE.get_or_init(|| {
+    // Remove inline Markdown image embeds to stop exfiltration/tracking pixels.
+    let re_img = RE_MD_IMAGE_INLINE.get_or_init(|| {
         Regex::new(r"!\[([^\]]*)\]\(([^)\s]+(?:\s+[^)]*)?)\)").expect("valid regex")
     });
-    let no_imgs = re_img.replace_all(&no_html_tags, |caps: &Captures| {
+    let no_inline_imgs = re_img.replace_all(&no_html_tags, |caps: &Captures| {
         let alt = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         if alt.is_empty() {
             "[external image blocked]".to_string()
@@ -361,22 +516,43 @@ pub fn sanitize_llm_markdown(md: &str) -> String {
         }
     });
 
-    // Only keep safe http/https/relative links; neutralize javascript:, data:, file:, etc.
-    let re_link =
-        RE_MD_LINK.get_or_init(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid regex"));
-    let safe_links = re_link.replace_all(&no_imgs, |caps: &Captures| {
+    // Also block reference-style Markdown images (`![alt][ref]` and `![alt][]`).
+    let re_ref_img = RE_MD_IMAGE_REF
+        .get_or_init(|| Regex::new(r"!\[([^\]]*)\]\[[^\]]*\]").expect("valid regex"));
+    let no_imgs = re_ref_img.replace_all(&no_inline_imgs, |caps: &Captures| {
+        let alt = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if alt.is_empty() {
+            "[external image blocked]".to_string()
+        } else {
+            format!("[image blocked: {alt}]")
+        }
+    });
+
+    // Only keep safe http/https/relative inline links; neutralize javascript:, data:, file:, etc.
+    let re_link = RE_MD_LINK_INLINE
+        .get_or_init(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid regex"));
+    let safe_inline_links = re_link.replace_all(&no_imgs, |caps: &Captures| {
         let label = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let target = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        let first_token = target.split_whitespace().next().unwrap_or("");
-        let lower = first_token.to_ascii_lowercase();
-        if lower.starts_with("https://")
-            || lower.starts_with("http://")
-            || lower.starts_with('#')
-            || lower.starts_with('/')
-        {
+        if is_safe_markdown_link_target(target) {
             format!("[{label}]({target})")
         } else {
             format!("{label} (unsafe-link-removed)")
+        }
+    });
+
+    // Sanitize reference-style link definitions (`[1]: javascript:alert(1)`).
+    let re_ref_def = RE_MD_REF_DEF.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]{0,3}\[([^\]]+)\]:[ \t]*(\S+)(.*)$").expect("valid regex")
+    });
+    let safe_links = re_ref_def.replace_all(&safe_inline_links, |caps: &Captures| {
+        let id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let target = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        if is_safe_markdown_link_target(target) {
+            format!("[{id}]: {target}{rest}")
+        } else {
+            format!("[{id}]: #unsafe-link-removed")
         }
     });
 
@@ -475,6 +651,162 @@ pub fn keychain_is_available() -> bool {
         return false;
     };
     matches!(entry.get_password(), Ok(_) | Err(keyring::Error::NoEntry))
+}
+
+/// Restricts permissions on local database, key, and bootstrap token files.
+/// Enforces `0600` on Unix and best-effort owner-only NTFS ACLs on Windows.
+pub fn restrict_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Skip expensive icacls calls for ephemeral unit-test temp files
+        if path.starts_with(std::env::temp_dir()) {
+            return;
+        }
+        if let Ok(user) = std::env::var("USERNAME") {
+            let user_trim = user.trim();
+            if !user_trim.is_empty() {
+                let principal = match std::env::var("USERDOMAIN") {
+                    Ok(dom) if !dom.trim().is_empty() => format!("{}\\{}", dom.trim(), user_trim),
+                    _ => user_trim.to_string(),
+                };
+                let grant = format!("{principal}:(F)");
+                let _ = std::process::Command::new("icacls")
+                    .arg(path)
+                    .arg("/inheritance:r")
+                    .arg("/grant:r")
+                    .arg(&grant)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+/// Authenticated AES-256-GCM field-level vault for sensitive local SQLite records
+/// (2FA TOTP seeds and Slack/Discord/Teams webhook bearer URLs).
+/// Key resolution priority:
+/// 1. `ABW_VAULT_KEY` env var (64-char hex 256-bit key for container/orchestrator secrets)
+/// 2. OS native Keychain (`keyring` v3) so a stolen `threat_board.db` alone cannot decrypt secrets
+/// 3. Fallback `0600` local keyfile (`<data_dir>/.abw_vault.key`) for headless containers
+#[derive(Clone)]
+pub struct LocalFieldVault {
+    key: [u8; 32],
+}
+
+impl LocalFieldVault {
+    pub fn load_or_init(data_dir: &Path) -> Self {
+        if let Ok(env_hex) = std::env::var("ABW_VAULT_KEY") {
+            if let Some(key) = decode_hex_key32(env_hex.trim()) {
+                return Self { key };
+            }
+        }
+
+        let is_temp_dir = data_dir.starts_with(std::env::temp_dir());
+
+        if !is_temp_dir {
+            if let Ok(Some(kc_hex)) = keychain_get(KEYCHAIN_ACCOUNT_DB_VAULT_KEY) {
+                if let Some(key) = decode_hex_key32(kc_hex.trim()) {
+                    return Self { key };
+                }
+            }
+        }
+
+        let key_path = data_dir.join(".abw_vault.key");
+        if let Ok(raw) = std::fs::read_to_string(&key_path) {
+            if let Some(key) = decode_hex_key32(raw.trim()) {
+                return Self { key };
+            }
+        }
+
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("OS CSPRNG failed generating vault key");
+        let hex_key = hex::encode(key);
+
+        if !is_temp_dir && keychain_set(KEYCHAIN_ACCOUNT_DB_VAULT_KEY, &hex_key).is_ok() {
+            return Self { key };
+        }
+
+        let _ = std::fs::create_dir_all(data_dir);
+        if std::fs::write(&key_path, format!("{hex_key}\n")).is_ok() {
+            restrict_private_file_permissions(&key_path);
+        }
+        Self { key }
+    }
+
+    pub fn encrypt_field(&self, aad: &str, plaintext: &str) -> Result<String, String> {
+        let cipher = Aes256Gcm::new_from_slice(&self.key)
+            .map_err(|e| format!("Vault cipher init error: {e}"))?;
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|e| format!("CSPRNG nonce generation error: {e}"))?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| "Vault AES-256-GCM encryption failed".to_string())?;
+        Ok(format!(
+            "enc:v1:{}:{}",
+            hex::encode(nonce_bytes),
+            hex::encode(ct)
+        ))
+    }
+
+    /// Decrypts `enc:v1:<nonce>:<ct>` values with AAD verification.
+    /// Legacy pre-v0.6.1 plaintext values pass through cleanly for seamless upgrade.
+    pub fn decrypt_field(&self, aad: &str, stored: &str) -> Result<String, String> {
+        let Some(rest) = stored.strip_prefix("enc:v1:") else {
+            return Ok(stored.to_string());
+        };
+        let Some((nonce_hex, ct_hex)) = rest.split_once(':') else {
+            return Err("Malformed encrypted vault payload".to_string());
+        };
+        let nonce_vec =
+            hex::decode(nonce_hex).map_err(|_| "Invalid vault nonce hex".to_string())?;
+        if nonce_vec.len() != 12 {
+            return Err("Invalid vault nonce length".to_string());
+        }
+        let ct = hex::decode(ct_hex).map_err(|_| "Invalid vault ciphertext hex".to_string())?;
+        let cipher = Aes256Gcm::new_from_slice(&self.key)
+            .map_err(|e| format!("Vault cipher init error: {e}"))?;
+        let pt = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_vec),
+                Payload {
+                    msg: ct.as_slice(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .map_err(|_| {
+                "Vault AES-256-GCM decryption failed (wrong key or tampered data)".to_string()
+            })?;
+        String::from_utf8(pt).map_err(|_| "Vault decrypted payload is not valid UTF-8".to_string())
+    }
+}
+
+fn decode_hex_key32(raw: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(raw).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
 }
 
 /// Generates a cryptographically random hex token using OS CSPRNG.
@@ -649,5 +981,89 @@ mod tests {
         assert!(constant_time_eq(&t1, &t1));
         assert!(!constant_time_eq(&t1, &t2));
         assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_transition_and_ipv4_special_ranges() {
+        let strict = OutboundUrlPolicy::StrictPublicHttps;
+        // IPv6 transition & special-use ranges
+        assert!(!is_ip_allowed(
+            "64:ff9b::127.0.0.1".parse().unwrap(),
+            strict
+        ));
+        assert!(!is_ip_allowed("64:ff9b:1::1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed("2002:7f00:0001::1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed(
+            "2001:0000:4136:e378::1".parse().unwrap(),
+            strict
+        ));
+        assert!(!is_ip_allowed("::127.0.0.1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed(
+            "::ffff:0:127.0.0.1".parse().unwrap(),
+            strict
+        ));
+        assert!(!is_ip_allowed("fec0::1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed("100::1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed("2001:2::1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed("2001:20::1".parse().unwrap(), strict));
+        // IPv4 Class E & IETF protocol assignments
+        assert!(!is_ip_allowed("240.0.0.1".parse().unwrap(), strict));
+        assert!(!is_ip_allowed("192.0.0.1".parse().unwrap(), strict));
+    }
+
+    #[tokio::test]
+    async fn validate_outbound_url_canonicalizes_trailing_dot_for_dns_pin() {
+        let ai_local = OutboundUrlPolicy::AiProvider { allow_lan: false };
+        let validated = validate_outbound_url("http://localhost.:11434/v1", ai_local)
+            .await
+            .unwrap();
+        assert_eq!(validated.host, "localhost");
+        assert_eq!(validated.url.host_str(), Some("localhost"));
+        assert!(!validated.url.as_str().contains("localhost."));
+    }
+
+    #[test]
+    fn sanitize_markdown_blocks_html_tags_and_reference_link_bypasses() {
+        let md = "Version <= 2.4.1\n<details open ontoggle=alert(1)>x</details>\n<marquee>hi</marquee>\n![px][img1]\n[click][js1]\n[angle](<javascript:alert(1)>)\n[ent](javascript&#58;alert(1))\n[proto](//evil.invalid/x)\n\n[img1]: https://evil.invalid/px.png\n[js1]: javascript:alert(9)\n[ok]: https://www.cisa.gov/";
+        let out = sanitize_llm_markdown(md);
+        assert!(out.contains("Version <= 2.4.1"));
+        assert!(!out.contains("<details"));
+        assert!(!out.contains("<marquee"));
+        assert!(!out.contains("![px]"));
+        assert!(out.contains("[image blocked: px]"));
+        assert!(!out.contains("javascript:"));
+        assert!(!out.contains("javascript&#58;"));
+        assert!(out.contains("[js1]: #unsafe-link-removed"));
+        assert!(out.contains("[ok]: https://www.cisa.gov/"));
+        assert!(out.contains("proto (unsafe-link-removed)"));
+    }
+
+    #[test]
+    fn local_field_vault_encrypts_with_aad_and_supports_legacy_plaintext() {
+        let dir = std::env::temp_dir().join(format!("abw_vault_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = LocalFieldVault::load_or_init(&dir);
+        let ct = vault
+            .encrypt_field(
+                "webhook_url:w1",
+                "https://hooks.slack.com/services/T/B/SECRET",
+            )
+            .unwrap();
+        assert!(ct.starts_with("enc:v1:"));
+        assert!(!ct.contains("SECRET"));
+        assert_eq!(
+            vault.decrypt_field("webhook_url:w1", &ct).unwrap(),
+            "https://hooks.slack.com/services/T/B/SECRET"
+        );
+        // Wrong AAD must fail authentication
+        assert!(vault.decrypt_field("webhook_url:w2", &ct).is_err());
+        // Legacy plaintext passthrough works seamlessly
+        assert_eq!(
+            vault
+                .decrypt_field("totp_secret_b32", "JBSWY3DPEHPK3PXP")
+                .unwrap(),
+            "JBSWY3DPEHPK3PXP"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

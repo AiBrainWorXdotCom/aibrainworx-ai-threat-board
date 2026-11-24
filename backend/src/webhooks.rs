@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -6,12 +7,15 @@ use regex::Regex;
 use serde_json::json;
 use sha2::Sha256;
 use url::Url;
+use uuid::Uuid;
 
 use crate::models::{
     Severity, ThreatAlert, Vulnerability, WebhookKind, WebhookTarget, WebhookTargetPublic,
     WebhookTestResponse,
 };
-use crate::security::{build_pinned_http_client, validate_outbound_url, OutboundUrlPolicy};
+use crate::security::{
+    build_pinned_http_client, constant_time_eq, validate_outbound_url, OutboundUrlPolicy,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -61,18 +65,88 @@ pub fn to_public_webhook(target: &WebhookTarget) -> WebhookTargetPublic {
         kev_only: target.kev_only,
         stack_only: target.stack_only,
         has_signing_secret: target.has_signing_secret || !target.signing_secret.is_empty(),
+        save_secret_to_keychain: target.save_secret_to_keychain,
         last_status: target.last_status.clone(),
         last_sent_at: target.last_sent_at,
         failure_count: target.failure_count,
     }
 }
 
+#[allow(dead_code)]
 pub fn sign_payload_hmac_sha256(secret: &str, body: &[u8]) -> Result<String, String> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|e| format!("Invalid HMAC key: {e}"))?;
     mac.update(body);
     let result = mac.finalize();
     Ok(format!("sha256={}", hex::encode(result.into_bytes())))
+}
+
+/// Computes a replay-protected HMAC-SHA256 signature binding Unix timestamp, unique
+/// delivery UUID, and exact payload bytes:
+///   `HMAC-SHA256(secret, "{timestamp}.{delivery_id}.{raw_body}")`
+/// Header format: `t=<timestamp>,id=<delivery_id>,v1=<hex_digest>`
+pub fn sign_webhook_delivery_hmac_sha256(
+    secret: &str,
+    timestamp: i64,
+    delivery_id: &str,
+    body: &[u8],
+) -> Result<String, String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("Invalid HMAC key: {e}"))?;
+    mac.update(format!("{timestamp}.{delivery_id}.").as_bytes());
+    mac.update(body);
+    let result = mac.finalize();
+    Ok(format!(
+        "t={timestamp},id={delivery_id},v1={}",
+        hex::encode(result.into_bytes())
+    ))
+}
+
+/// Verifies a replay-protected `X-AiBrainWorX-Signature-256` header against `secret`,
+/// `timestamp`, `delivery_id`, and `body` within `max_skew_secs` (constant-time).
+#[allow(dead_code)]
+pub fn verify_webhook_delivery_hmac_sha256(
+    secret: &str,
+    timestamp: i64,
+    delivery_id: &str,
+    body: &[u8],
+    signature_header: &str,
+    now_unix: i64,
+    max_skew_secs: i64,
+) -> Result<(), String> {
+    if (now_unix - timestamp).abs() > max_skew_secs {
+        return Err(format!(
+            "Webhook timestamp outside allowed replay window ({max_skew_secs}s)"
+        ));
+    }
+    let mut hdr_t: Option<i64> = None;
+    let mut hdr_id: Option<&str> = None;
+    let mut hdr_v1: Option<&str> = None;
+    for part in signature_header.split(',') {
+        let trimmed = part.trim();
+        if let Some(v) = trimmed.strip_prefix("t=") {
+            hdr_t = v.parse::<i64>().ok();
+        } else if let Some(v) = trimmed.strip_prefix("id=") {
+            hdr_id = Some(v);
+        } else if let Some(v) = trimmed.strip_prefix("v1=") {
+            hdr_v1 = Some(v);
+        }
+    }
+    if hdr_t != Some(timestamp) || hdr_id != Some(delivery_id) {
+        return Err("Signature header metadata mismatch with timestamp/delivery_id".into());
+    }
+    let Some(sig_v1) = hdr_v1 else {
+        return Err("Missing v1 signature component".into());
+    };
+    let expected = sign_webhook_delivery_hmac_sha256(secret, timestamp, delivery_id, body)?;
+    let expected_v1 = expected
+        .rsplit_once(",v1=")
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    if !constant_time_eq(sig_v1, expected_v1) {
+        return Err("Invalid HMAC-SHA256 webhook signature".into());
+    }
+    Ok(())
 }
 
 fn discord_color(sev: Severity) -> u32 {
@@ -197,14 +271,34 @@ pub async fn send_webhook_payload(
         }
     };
 
+    let timestamp = Utc::now().timestamp();
+    let delivery_id = Uuid::new_v4().to_string();
+
     let mut req = client
         .post(validated.url)
         .header("Content-Type", "application/json")
-        .header("X-AiBrainWorX-Event", "threat_alert");
+        .header("X-AiBrainWorX-Event", "threat_alert")
+        .header("X-AiBrainWorX-Timestamp", timestamp.to_string())
+        .header("X-AiBrainWorX-Delivery-Id", &delivery_id);
 
     if !target.signing_secret.trim().is_empty() {
-        if let Ok(sig) = sign_payload_hmac_sha256(target.signing_secret.trim(), &body_bytes) {
-            req = req.header("X-AiBrainWorX-Signature-256", sig);
+        match sign_webhook_delivery_hmac_sha256(
+            target.signing_secret.trim(),
+            timestamp,
+            &delivery_id,
+            &body_bytes,
+        ) {
+            Ok(sig) => {
+                req = req.header("X-AiBrainWorX-Signature-256", sig);
+            }
+            Err(e) => {
+                return WebhookTestResponse {
+                    ok: false,
+                    status_code: None,
+                    message: format!("Webhook signing aborted: {e}"),
+                    latency_ms: start.elapsed().as_millis() as u64,
+                };
+            }
         }
     }
 
@@ -238,7 +332,8 @@ pub async fn send_webhook_payload(
 }
 
 fn redact_url_in_error(msg: &str) -> String {
-    let re = Regex::new(r"https?://[^\s)]+").expect("valid regex");
+    static RE_URL: OnceLock<Regex> = OnceLock::new();
+    let re = RE_URL.get_or_init(|| Regex::new(r"https?://[^\s)]+").expect("valid regex"));
     re.replace_all(msg, "[redacted-webhook-url]").into_owned()
 }
 
@@ -366,5 +461,70 @@ mod tests {
             ..miss
         };
         assert!(webhook_matches_item(&target, &hit));
+    }
+
+    #[test]
+    fn webhook_replay_protected_signature_verifies_and_rejects_stale_or_tampered() {
+        let body = br#"{"event":"threat_alert","severity":"CRITICAL"}"#;
+        let ts = 1_760_000_000i64;
+        let delivery_id = "11111111-2222-4333-8444-555555555555";
+        let sig = sign_webhook_delivery_hmac_sha256("top-secret", ts, delivery_id, body).unwrap();
+        assert!(sig.starts_with(&format!("t={ts},id={delivery_id},v1=")));
+
+        // Valid within 300s skew window
+        assert!(verify_webhook_delivery_hmac_sha256(
+            "top-secret",
+            ts,
+            delivery_id,
+            body,
+            &sig,
+            ts + 45,
+            300
+        )
+        .is_ok());
+
+        // Stale replay outside 300s window is rejected
+        assert!(verify_webhook_delivery_hmac_sha256(
+            "top-secret",
+            ts,
+            delivery_id,
+            body,
+            &sig,
+            ts + 301,
+            300
+        )
+        .is_err());
+
+        // Tampered body or wrong secret or mismatched delivery_id is rejected
+        assert!(verify_webhook_delivery_hmac_sha256(
+            "top-secret",
+            ts,
+            delivery_id,
+            br#"{"event":"tampered"}"#,
+            &sig,
+            ts + 10,
+            300
+        )
+        .is_err());
+        assert!(verify_webhook_delivery_hmac_sha256(
+            "wrong-secret",
+            ts,
+            delivery_id,
+            body,
+            &sig,
+            ts + 10,
+            300
+        )
+        .is_err());
+        assert!(verify_webhook_delivery_hmac_sha256(
+            "top-secret",
+            ts,
+            "99999999-2222-4333-8444-555555555555",
+            body,
+            &sig,
+            ts + 10,
+            300
+        )
+        .is_err());
     }
 }
